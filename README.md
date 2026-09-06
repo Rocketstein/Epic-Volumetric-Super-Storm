@@ -74,6 +74,3 @@ VolumetricSuperStorm.uproject   Unreal Engine project file
 
 Use of the product is governed by the license terms provided through its [Fab listing](https://www.fab.com/listings/1c2d0fea-7278-49f0-9559-3efef3076ac0). Third-party components and assets may carry separate terms; see [CREDITS.md](Plugins/SavageSuperStorm/CREDITS.md).
 
-## Notice
-
-This product was independently developed during the Epic Project, a developer-support program of KRAFTON JUNGLE GameTech Lab. KRAFTON was not involved in its development or distribution.
