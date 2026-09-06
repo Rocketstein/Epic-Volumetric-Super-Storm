@@ -1,0 +1,11 @@
+/**
+ * @file StormBottomTypeContract.ush
+ * @brief Defines the bottom-type density response shared by material entry points.
+ */
+
+#pragma once
+
+float StormEvaluateBottomTypeWispyAmount(float BottomType)
+{
+	return saturate(BottomType);
+}

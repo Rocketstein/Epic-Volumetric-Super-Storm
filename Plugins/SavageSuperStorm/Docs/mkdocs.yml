@@ -1,0 +1,82 @@
+site_name: Savage Super Storm
+site_description: Volumetric storm plugin for Unreal Engine 5.8 — setup guide and authoring reference.
+site_url: https://team-gorogoro.github.io/VolumetricSuperstorm_Docs/
+copyright: Copyright &copy; Team GoroGoro
+
+docs_dir: docs
+site_dir: site
+
+theme:
+  name: material
+  icon:
+    logo: material/weather-lightning
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.instant
+    - navigation.tracking
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.tabs.link
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: blue grey
+      accent: amber
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: blue grey
+      accent: amber
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - footnotes
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+plugins:
+  - search
+
+extra_css:
+  - stylesheets/extra.css
+
+strict: true
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Requirements: getting-started/requirements.md
+      - Installation: getting-started/installation.md
+      - Your First Superstorm: getting-started/first-storm.md
+  - Authoring Guides:
+      - Core Parameters: guides/core-parameters.md
+      - Flow Map: guides/flow-map.md
+      - Vertical Profile: guides/vertical-profile.md
+      - Presets: guides/presets.md
+  - Reference:
+      - Storm Actor: reference/actor.md
+      - Components: reference/components.md
+      - Blueprint API: reference/blueprint-api.md
+  - Limitations: limitations.md
+  - Troubleshooting: troubleshooting.md
+  - Changelog: changelog.md

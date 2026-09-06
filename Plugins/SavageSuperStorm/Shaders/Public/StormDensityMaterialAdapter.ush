@@ -1,0 +1,463 @@
+/**
+ * @file StormDensityMaterialAdapter.ush
+ * @brief Provides shared density and lifecycle transport helpers.
+ */
+
+#pragma once
+
+#include "/SavageSuperStormShaders/Public/StormDensityField.ush"
+#include "/SavageSuperStormShaders/Public/StormSpiralContract.ush"
+
+struct FStormLifecycleSample
+{
+	uint  Mode;
+	float Progress;
+};
+
+struct FStormDomainSample
+{
+	float  MatureColumn;
+	float  SuperstormCoverage;
+	float  FeederSupport;
+	float  Radius01;
+	float2 BodyCoord;
+	float2 Radial;
+	float2 Tangent;
+};
+
+float StormTransportSmoother01(float Value)
+{
+	float x = saturate(Value);
+	return x * x * x * (x * (x * 6.0 - 15.0) + 10.0);
+}
+
+float2 StormTransportSafeDirection(float2 Value)
+{
+	float lengthSquared = dot(Value, Value);
+	return lengthSquared > 1.0e-8 ? Value * rsqrt(lengthSquared) : float2(0.70710678, 0.70710678);
+}
+
+float StormTransportMacro(float2 BodyCoord, float HLocal, float Salt)
+{
+	float2 q      = BodyCoord * float2(1.27, 0.93) + float2(HLocal * 0.37, -HLocal * 0.29);
+	float  phaseA = dot(q, float2(1.73, -2.11)) + Salt * 0.071;
+	float  phaseB = dot(q.yx, float2(-2.67, 1.31)) - HLocal * 1.17 + Salt * 0.043;
+	float  phaseC = dot(q, float2(3.91, 2.83)) + sin(phaseA) * 0.73 - cos(phaseB) * 0.57 + Salt * 0.019;
+	return saturate(0.5 + sin(phaseA) * 0.22 + cos(phaseB) * 0.17 + sin(phaseC) * 0.11);
+}
+
+float StormTransportLane(float2 BodyCoord, float HLocal)
+{
+	float macroA = StormTransportMacro(BodyCoord, HLocal, 19.7);
+	float macroB = StormTransportMacro(BodyCoord * float2(0.73, 1.31) + float2(macroA - 0.5, 0.0), HLocal, 53.9);
+	float ridgeA = 1.0 - abs(macroA * 2.0 - 1.0);
+	float ridgeB = 1.0 - abs(macroB * 2.0 - 1.0);
+
+	float angle       = atan2(BodyCoord.y, BodyCoord.x);
+	float radius      = length(BodyCoord);
+	float angularBias = 0.5 + 0.5 * sin(angle * lerp(1.37, 2.91, macroB) + radius * lerp(2.2, 6.4, macroA) + (macroA - macroB) * 4.9);
+	float broken      = StormTransportMacro(BodyCoord * 1.91 + float2(macroB, -macroA), HLocal, 91.1);
+	return saturate(ridgeA * 0.34 + ridgeB * 0.26 + angularBias * broken * 0.18 + broken * 0.22);
+}
+
+FStormLifecycleSample StormDecodeLifecycle(float EncodedControl)
+{
+	FStormLifecycleSample result;
+	if (EncodedControl < 1.0)
+	{
+		result.Mode     = 0u;
+		result.Progress = saturate(EncodedControl);
+	}
+	else if (EncodedControl < 2.0)
+	{
+		result.Mode     = 1u;
+		result.Progress = 1.0;
+	}
+	else if (EncodedControl < 3.0)
+	{
+		result.Mode     = 2u;
+		result.Progress = saturate(EncodedControl - 2.0);
+	}
+	else
+	{
+		result.Mode     = 3u;
+		result.Progress = 1.0;
+	}
+	return result;
+}
+
+FStormDomainSample StormDecodeTransportDomain(float PackedStencil, float3 WorldPosition, float3 StormCenterRadius)
+{
+	FStormDomainSample result;
+	result.MatureColumn       = PackedStencil > 1.0 ? 1.0 : 0.0;
+	result.SuperstormCoverage = result.MatureColumn > 0.5 ? saturate(PackedStencil - 1.0) : 0.0;
+	result.FeederSupport      = result.MatureColumn > 0.5 ? 1.0 : saturate(PackedStencil);
+
+	result.BodyCoord = StormWorldPositionToBodyCoord(WorldPosition, StormCenterRadius);
+	result.Radius01  = length(result.BodyCoord);
+	result.Radial    = StormTransportSafeDirection(result.BodyCoord);
+	result.Tangent   = float2(-result.Radial.y, result.Radial.x);
+	return result;
+}
+
+static const float STORM_ANVIL_MAX_HEIGHT_TWIST_RADIANS = 0.5235987756;
+
+float StormEvaluateAnvilHeightTwistWeight(float AnvilCoord, float TwistStart01)
+{
+	float upperHeight01 = 1.0 - saturate(AnvilCoord);
+	float start01       = clamp(TwistStart01, 0.0, 0.9);
+	float t             = smoothstep(start01, 1.0, upperHeight01);
+	return t * t;
+}
+
+void StormBuildAnvilHeightTwistedNoiseCoordinates(FStormDomainSample Domain, float AnvilCoord, float RotationSign, float AnvilHeightTwistRadians, float AnvilHeightTwistStart01, float LFUnitsPerBodyRadius, float HFUnitsPerBodyRadius, float3 BaseLFUVW, float3 BaseHFUVW, float2 BaseCurlUVW, out float3 OutAnvilLFUVW, out float3 OutAnvilHFUVW, out float2 OutAnvilCurlUVW)
+{
+	float weight     = StormEvaluateAnvilHeightTwistWeight(AnvilCoord, AnvilHeightTwistStart01);
+	float handedness = RotationSign < 0.0 ? -1.0 : 1.0;
+	float angle      = handedness * clamp(AnvilHeightTwistRadians, -STORM_ANVIL_MAX_HEIGHT_TWIST_RADIANS, STORM_ANVIL_MAX_HEIGHT_TWIST_RADIANS) * weight;
+
+	float2 sourceBodyCoord = StormSpiralRotate2D(Domain.BodyCoord, -angle);
+	float2 bodyOffset      = sourceBodyCoord - Domain.BodyCoord;
+
+	OutAnvilLFUVW    = BaseLFUVW;
+	OutAnvilLFUVW.xy += bodyOffset * LFUnitsPerBodyRadius;
+
+	OutAnvilHFUVW    = BaseHFUVW;
+	OutAnvilHFUVW.xy += bodyOffset * HFUnitsPerBodyRadius;
+
+	OutAnvilCurlUVW = BaseCurlUVW;
+}
+
+void StormSampleDensityNoiseUVW(Texture3D LFNoiseTex, SamplerState LFNoiseSampler, Texture3D HFNoiseTex, SamplerState HFNoiseSampler, Texture2D CurlNoiseTex, SamplerState CurlNoiseSampler, float3 LFUVW, float3 HFUVW, float2 CurlUVW, float CurlTiling, float CurlDisplacementUVW, float HLocal, float BaseBottomType, out float OutLFShape, out float OutHFModifier)
+{
+	float4 lfRaw = Texture3DSampleLevel(LFNoiseTex, LFNoiseSampler, frac(LFUVW), 0);
+	OutLFShape   = StormDecodeLowFrequencyShape(lfRaw);
+
+	float2 curlUV      = frac(CurlUVW * max(abs(CurlTiling), 1.0e-3));
+	float2 curlVector  = Texture2DSampleLevel(CurlNoiseTex, CurlNoiseSampler, curlUV, 0).rg * 2.0 - 1.0;
+	float3 warpedHFUVW = HFUVW;
+	float  curlWeight  = StormEvaluateUndersideCurlWeight(HLocal, BaseBottomType);
+	warpedHFUVW.xz     += curlVector * CurlDisplacementUVW * curlWeight;
+
+	float3 hfRaw  = Texture3DSampleLevel(HFNoiseTex, HFNoiseSampler, frac(warpedHFUVW), 0).rgb;
+	OutHFModifier = StormEvaluateBottomTypeHFModifier(hfRaw, HLocal, BaseBottomType);
+}
+
+void StormSampleDensityNoiseUVWPhased(Texture3D LFNoiseTex, SamplerState LFNoiseSampler, Texture3D HFNoiseTex, SamplerState HFNoiseSampler, Texture2D CurlNoiseTex, SamplerState CurlNoiseSampler, float3 LFUVW, float3 HFUVW, float3 FlowOffsetA, float3 FlowOffsetB, float PhaseAWeight, float2 CurlUVW, float CurlTiling, float CurlDisplacementUVW, float HLocal, float BaseBottomType, out float OutLFShape, out float OutHFModifier)
+{
+	float lfShapeA;
+	float hfModifierA;
+	StormSampleDensityNoiseUVW(LFNoiseTex, LFNoiseSampler, HFNoiseTex, HFNoiseSampler, CurlNoiseTex, CurlNoiseSampler, LFUVW - FlowOffsetA, HFUVW - FlowOffsetA, CurlUVW, CurlTiling, CurlDisplacementUVW, HLocal, BaseBottomType, lfShapeA, hfModifierA);
+
+	float lfShapeB;
+	float hfModifierB;
+	StormSampleDensityNoiseUVW(LFNoiseTex, LFNoiseSampler, HFNoiseTex, HFNoiseSampler, CurlNoiseTex, CurlNoiseSampler, LFUVW - FlowOffsetB, HFUVW - FlowOffsetB, CurlUVW, CurlTiling, CurlDisplacementUVW, HLocal, BaseBottomType, lfShapeB, hfModifierB);
+
+	float phaseAWeight = saturate(PhaseAWeight);
+	OutLFShape         = lerp(lfShapeB, lfShapeA, phaseAWeight);
+	OutHFModifier      = lerp(hfModifierB, hfModifierA, phaseAWeight);
+}
+
+void StormSampleAnvilHeightTwistedNoiseUVWPhased(Texture3D LFNoiseTex, SamplerState LFNoiseSampler, Texture3D HFNoiseTex, SamplerState HFNoiseSampler, Texture2D CurlNoiseTex, SamplerState CurlNoiseSampler, FStormDomainSample Domain, float AnvilCoord, float RotationSign, float AnvilHeightTwistRadians, float AnvilHeightTwistStart01, float LFUnitsPerBodyRadius, float HFUnitsPerBodyRadius, float3 LFUVW, float3 HFUVW, float3 FlowOffsetA, float3 FlowOffsetB, float PhaseAWeight, float2 CurlUVW, float CurlTiling, float CurlDisplacementUVW, float HLocal, float BaseBottomType, out float OutLFShape, out float OutHFModifier)
+{
+	float3 anvilLFUVW;
+	float3 anvilHFUVW;
+	float2 anvilCurlUVW;
+	StormBuildAnvilHeightTwistedNoiseCoordinates(Domain, AnvilCoord, RotationSign, AnvilHeightTwistRadians, AnvilHeightTwistStart01, LFUnitsPerBodyRadius, HFUnitsPerBodyRadius, LFUVW, HFUVW, CurlUVW, anvilLFUVW, anvilHFUVW, anvilCurlUVW);
+
+	StormSampleDensityNoiseUVWPhased(LFNoiseTex, LFNoiseSampler, HFNoiseTex, HFNoiseSampler, CurlNoiseTex, CurlNoiseSampler, anvilLFUVW, anvilHFUVW, FlowOffsetA, FlowOffsetB, PhaseAWeight, anvilCurlUVW, CurlTiling, CurlDisplacementUVW, HLocal, BaseBottomType, OutLFShape, OutHFModifier);
+}
+
+void StormEvaluateDensityFromSamples(float LFShape, float HFModifier, float VerticalProfile, float Coverage, float DensityGamma, float HFStrength, float HeightInside, float StormStencil, out float OutCoarseDensity, out float OutFineDensity)
+{
+	float densityGamma       = max(DensityGamma, 1.0e-3);
+	float coarseCoveredCloud = StormEvaluateCoveredBaseCloud(LFShape, VerticalProfile, Coverage);
+	coarseCoveredCloud       = pow(coarseCoveredCloud, densityGamma);
+	OutCoarseDensity         = StormApplyDensityMasks(coarseCoveredCloud, HeightInside, StormStencil);
+
+	float fineCarrier      = StormApplyHFErosion(LFShape, HFModifier, HFStrength);
+	float fineCoveredCloud = StormEvaluateCoveredBaseCloud(fineCarrier, VerticalProfile, Coverage);
+	fineCoveredCloud       = pow(fineCoveredCloud, densityGamma);
+	OutFineDensity         = StormApplyDensityMasks(fineCoveredCloud, HeightInside, StormStencil);
+}
+
+void StormEvaluateBodyAndAnvilDensityFromSharedErosion(float BodyLFShape, float BodyHFModifier, float AnvilLFShape, float AnvilHFModifier, float BodyVerticalProfile, float BodyCoverage, float BodyHeightInside, float AnvilVerticalProfile, float AnvilCoverageField, float AnvilHeightMask, float AnvilWeight, float DensityGamma, float HFStrength, float OverallShapeSupport, out float OutCoarseDensity, out float OutFineDensity)
+{
+	bool anvilActive = AnvilWeight > 1.0e-4 && AnvilHeightMask > 1.0e-4 && AnvilCoverageField > 1.0e-4;
+
+	if (!anvilActive)
+	{
+		StormEvaluateDensityFromSamples(BodyLFShape, BodyHFModifier, BodyVerticalProfile, BodyCoverage, DensityGamma, HFStrength, BodyHeightInside, OverallShapeSupport, OutCoarseDensity, OutFineDensity);
+		return;
+	}
+
+	float supportedAnvilCoverage = saturate(AnvilCoverageField) * saturate(OverallShapeSupport);
+
+	float bodyDimensionalProfile  = StormEvaluateDimensionalProfile(BodyVerticalProfile, BodyCoverage, BodyHeightInside);
+	float anvilDimensionalProfile = StormEvaluateDimensionalProfile(AnvilVerticalProfile, supportedAnvilCoverage, AnvilHeightMask);
+	float unionDimensionalProfile = max(bodyDimensionalProfile, anvilDimensionalProfile);
+
+	float anvilCarrierWeight = StormEvaluateAnvilCarrierWeight(bodyDimensionalProfile, anvilDimensionalProfile);
+	float unionLFShape       = lerp(saturate(BodyLFShape), saturate(AnvilLFShape), anvilCarrierWeight);
+	float unionHFModifier    = lerp(saturate(BodyHFModifier), saturate(AnvilHFModifier), anvilCarrierWeight);
+
+	float fineCarrier = StormApplyHFErosion(unionLFShape, unionHFModifier, HFStrength);
+	OutCoarseDensity  = StormEvaluateDensityFromDimensionalProfile(unionLFShape, unionDimensionalProfile, DensityGamma);
+	OutFineDensity    = min(StormEvaluateDensityFromDimensionalProfile(fineCarrier, unionDimensionalProfile, DensityGamma), OutCoarseDensity);
+}
+
+float2 StormFormationFieldWarp(float2 BodyCoord, float HLocal, float Salt)
+{
+	float2 q      = BodyCoord * float2(1.13, 0.91) + float2(HLocal * 0.23, -HLocal * 0.31);
+	float  phaseA = dot(q, float2(1.71, -2.09)) + Salt * 0.113;
+	float  phaseB = dot(q, float2(-2.83, 1.27)) - HLocal * 1.37 + Salt * 0.071;
+	float  phaseC = dot(q, float2(4.11, 3.37)) + sin(phaseA) * 0.83 - cos(phaseB) * 0.61 + Salt * 0.037;
+	float2 field  = float2(sin(phaseA) * 0.52 + sin(phaseB * 0.73 + cos(phaseC)) * 0.31 + cos(phaseC) * 0.17, cos(phaseB) * 0.49 + sin(phaseC * 0.67 + sin(phaseA)) * 0.34 - sin(phaseA * 0.47) * 0.17);
+	return clamp(field * 0.5, -0.5, 0.5);
+}
+
+void StormBuildFormationTransport(FStormDomainSample Domain, float HLocal, float HeightInside, float GlobalProgress, float RotationSign, float3 LFUVW, float3 HFUVW, float LFUnitsPerBodyRadius, float HFUnitsPerBodyRadius, out float3 OutLFUVW, out float3 OutHFUVW, out float OutCondensation)
+{
+	float  progress           = saturate(GlobalProgress);
+	float  handedness         = RotationSign < 0.0 ? -1.0 : 1.0;
+	float2 matureBodyCoord    = Domain.BodyCoord;
+	float  consolidationClock = saturate((progress - 0.05) / 0.70);
+	float  consolidationPulse = 4.0 * consolidationClock * (1.0 - consolidationClock);
+	float  rotationClock      = StormTransportSmoother01((progress - 0.035) / 0.745);
+	float  rotationTravel     = 1.0 - rotationClock;
+	float  motionSettle       = 1.0 - StormTransportSmoother01((progress - 0.72) / 0.12);
+	float  heightTwist        = StormTransportSmoother01((HLocal - 0.03) / 0.88);
+	float  coreTwist          = 1.0 - StormTransportSmoother01((Domain.Radius01 - 0.43) / 0.57);
+	float  swirlAngle         = handedness * rotationTravel * lerp(0.36, 0.96, heightTwist) * lerp(0.44, 1.0, coreTwist) * lerp(0.97, 1.12, consolidationPulse);
+	float  swirlSin;
+	float  swirlCos;
+	sincos(swirlAngle, swirlSin, swirlCos);
+	Domain.BodyCoord = float2(Domain.BodyCoord.x * swirlCos - Domain.BodyCoord.y * swirlSin, Domain.BodyCoord.x * swirlSin + Domain.BodyCoord.y * swirlCos);
+	Domain.Radial    = StormTransportSafeDirection(Domain.BodyCoord);
+	Domain.Tangent   = float2(-Domain.Radial.y, Domain.Radial.x);
+
+	float  macro     = StormTransportMacro(Domain.BodyCoord, HLocal, 41.3);
+	float  pulse     = StormTransportMacro(Domain.BodyCoord * lerp(0.79, 1.43, macro), HLocal, 83.9);
+	float2 fieldWarp = StormFormationFieldWarp(Domain.BodyCoord, HLocal, 127.1);
+	float  lane      = StormTransportLane(Domain.BodyCoord + fieldWarp * 0.21, HLocal);
+
+	float startTime     = saturate(0.015 + (1.0 - lane) * lerp(0.035, 0.18, macro) + Domain.Radius01 * lerp(0.005, 0.055, 1.0 - pulse) + (StormTransportMacro(Domain.BodyCoord * 1.17 + fieldWarp * 0.29, HLocal, 159.7) - 0.5) * 0.11);
+	float duration      = lerp(0.46, 0.68, StormTransportMacro(Domain.BodyCoord * 1.07 - fieldWarp * 0.17, HLocal, 181.9));
+	duration            = min(duration, 0.94 - startTime);
+	float localProgress = StormTransportSmoother01((progress - startTime) / max(duration, 0.10));
+	float arrival       = pow(localProgress, 1.18);
+
+	float captureNoise  = StormTransportMacro(Domain.BodyCoord * 0.74 + fieldWarp * 0.13, HLocal, 223.7);
+	float captureRadius = lerp(0.17, 0.39, captureNoise);
+	float sourceRing    = lerp(0.96, 1.30, macro) + (pulse - 0.5) * 0.13;
+	float captureMetric = Domain.Radius01 + dot(fieldWarp, Domain.Radial) * 0.19 + (lane - 0.5) * 0.11;
+	float captureGate   = smoothstep(captureRadius - 0.10, captureRadius + 0.16, captureMetric);
+
+	float travelDistance = min(max(sourceRing + 0.12 - max(Domain.Radius01, captureRadius), 0.0), 0.48);
+	travelDistance       *= (1.0 - arrival) * captureGate * lerp(0.96, 1.38, consolidationPulse) * motionSettle;
+
+	float  flowChannel     = saturate(lane * 0.56 + macro * 0.27 + pulse * 0.17);
+	float  flowUpdraft     = StormTransportSmoother01((flowChannel - 0.24) / 0.70);
+	float  tangentialDrift = handedness * lerp(0.70, 0.24, saturate(Domain.Radius01)) * lerp(1.00, 1.92, consolidationPulse) + dot(fieldWarp, Domain.Tangent) * 0.72 + (pulse - 0.5) * 0.29;
+	float2 curvedDirection = StormTransportSafeDirection(Domain.Radial * lerp(0.58, 0.34, flowChannel) + Domain.Tangent * tangentialDrift + fieldWarp * 0.34);
+	float2 sourceBody      = Domain.BodyCoord + curvedDirection * travelDistance * lerp(0.90, 1.10, flowChannel);
+	float2 spinOffset      = sourceBody - Domain.BodyCoord;
+	float2 bodyOffset      = float2(spinOffset.x * swirlCos + spinOffset.y * swirlSin, -spinOffset.x * swirlSin + spinOffset.y * swirlCos);
+
+	float  lfUnits          = abs(LFUnitsPerBodyRadius);
+	float  hfUnits          = abs(HFUnitsPerBodyRadius);
+	float2 columnSpinOffset = Domain.BodyCoord - matureBodyCoord;
+	OutLFUVW                = LFUVW;
+	OutHFUVW                = HFUVW;
+	OutLFUVW.xy             += (bodyOffset + columnSpinOffset * 0.82) * lfUnits;
+	OutHFUVW.xy             += (bodyOffset + columnSpinOffset) * hfUnits;
+
+	float liftArc = localProgress * (1.0 - localProgress) * captureGate * lerp(0.12, 0.38, flowUpdraft) * lerp(0.38, 1.0, saturate(HLocal)) * motionSettle;
+	OutLFUVW.z    -= liftArc * lfUnits * 0.52;
+	OutHFUVW.z    -= liftArc * hfUnits * 0.72;
+
+	float travelNoise       = StormTransportMacro(Domain.BodyCoord * 1.57 + fieldWarp * 0.28 + float2(HLocal * 0.23, -HLocal * 0.31), HLocal, 541.1);
+	float towerNoise        = StormTransportMacro(Domain.BodyCoord * 1.31 + fieldWarp * 0.21, HLocal, 673.3);
+	float verticalCost      = pow(saturate(HLocal), lerp(0.72, 1.56, pulse)) * lerp(0.10, 0.25, 1.0 - flowUpdraft) * lerp(0.58, 1.42, towerNoise);
+	float basinArrival      = max(startTime + verticalCost + Domain.Radius01 * lerp(0.01, 0.08, 1.0 - macro) + (travelNoise - 0.5) * 0.20 + (towerNoise - 0.5) * 0.10 - flowUpdraft * 0.08, 0.0) * 0.46 + 0.035;
+	float localCondensation = StormTransportSmoother01((progress - basinArrival) / lerp(0.22, 0.34, macro));
+
+	float orbitClock    = StormTransportSmoother01((progress - 0.02) / 0.76);
+	float orbitRemain   = 1.0 - orbitClock;
+	float orbitEnvelope = pow(saturate(orbitRemain), 0.82);
+	float orbitHeight   = lerp(0.82, 1.18, heightTwist);
+	float orbitAngle    = handedness * orbitEnvelope * orbitHeight * lerp(0.82, 0.68, consolidationPulse);
+	float orbitSin;
+	float orbitCos;
+	sincos(orbitAngle, orbitSin, orbitCos);
+	float2 seedWarp = fieldWarp * 0.10;
+
+	float2 seedBaseA      = float2(-0.34, 0.12);
+	float2 seedBaseB      = float2(0.27, -0.23);
+	float2 seedBaseC      = float2(0.17, 0.35);
+	float2 seedBaseD      = float2(-0.08, -0.38);
+	float  spreadProgress = StormTransportSmoother01((progress - 0.01) / 0.79);
+	float  spreadA        = lerp(1.72, 1.0, spreadProgress);
+	float  spreadB        = lerp(1.58, 1.0, StormTransportSmoother01((progress - 0.025) / 0.735));
+	float  spreadC        = lerp(1.66, 1.0, StormTransportSmoother01((progress - 0.045) / 0.745));
+	float  spreadD        = lerp(1.78, 1.0, StormTransportSmoother01((progress - 0.065) / 0.735));
+	float2 seedA0         = seedBaseA * spreadA + float2(-seedBaseA.y, seedBaseA.x) * handedness * orbitEnvelope * 0.110;
+	float2 seedB0         = seedBaseB * spreadB + float2(-seedBaseB.y, seedBaseB.x) * handedness * orbitEnvelope * 0.060;
+	float2 seedC0         = seedBaseC * spreadC - float2(-seedBaseC.y, seedBaseC.x) * handedness * orbitEnvelope * 0.075;
+	float2 seedD0         = seedBaseD * spreadD + float2(-seedBaseD.y, seedBaseD.x) * handedness * orbitEnvelope * 0.090;
+	float2 seedA          = float2(seedA0.x * orbitCos - seedA0.y * orbitSin, seedA0.x * orbitSin + seedA0.y * orbitCos);
+	float2 seedB          = float2(seedB0.x * orbitCos - seedB0.y * orbitSin, seedB0.x * orbitSin + seedB0.y * orbitCos);
+	float2 seedC          = float2(seedC0.x * orbitCos - seedC0.y * orbitSin, seedC0.x * orbitSin + seedC0.y * orbitCos);
+	float2 seedD          = float2(seedD0.x * orbitCos - seedD0.y * orbitSin, seedD0.x * orbitSin + seedD0.y * orbitCos);
+
+	float2 seedDeltaA = Domain.BodyCoord + seedWarp - seedA;
+	float2 seedDeltaB = Domain.BodyCoord - seedWarp * 0.63 - seedB;
+	float2 seedDeltaC = Domain.BodyCoord + seedWarp.yx * float2(-0.74, 0.58) - seedC;
+	float2 seedDeltaD = Domain.BodyCoord + seedWarp.yx * float2(0.51, -0.69) - seedD;
+	float2 seedTanA0  = float2(-0.333, -0.943);
+	float2 seedTanB0  = float2(0.648, 0.761);
+	float2 seedTanC0  = float2(-0.900, 0.437);
+	float2 seedTanD0  = float2(0.979, -0.206);
+	float2 seedTanA   = float2(seedTanA0.x * orbitCos - seedTanA0.y * orbitSin, seedTanA0.x * orbitSin + seedTanA0.y * orbitCos);
+	float2 seedTanB   = float2(seedTanB0.x * orbitCos - seedTanB0.y * orbitSin, seedTanB0.x * orbitSin + seedTanB0.y * orbitCos);
+	float2 seedTanC   = float2(seedTanC0.x * orbitCos - seedTanC0.y * orbitSin, seedTanC0.x * orbitSin + seedTanC0.y * orbitCos);
+	float2 seedTanD   = float2(seedTanD0.x * orbitCos - seedTanD0.y * orbitSin, seedTanD0.x * orbitSin + seedTanD0.y * orbitCos);
+	float  stretch    = lerp(0.90, 0.36, consolidationPulse);
+	float  alongA     = dot(seedDeltaA, seedTanA);
+	float  alongB     = dot(seedDeltaB, seedTanB);
+	float  alongC     = dot(seedDeltaC, seedTanC);
+	float  alongD     = dot(seedDeltaD, seedTanD);
+	float  metricA    = dot(seedDeltaA, seedDeltaA) + alongA * alongA * (stretch - 1.0);
+	float  metricB    = dot(seedDeltaB, seedDeltaB) + alongB * alongB * (stretch - 1.0);
+	float  metricC    = dot(seedDeltaC, seedDeltaC) + alongC * alongC * (stretch - 1.0);
+	float  metricD    = dot(seedDeltaD, seedDeltaD) + alongD * alongD * (stretch - 1.0);
+
+	float seedClockA   = StormTransportSmoother01(progress / 0.61);
+	float seedClockB   = StormTransportSmoother01((progress - 0.045) / 0.60);
+	float seedClockC   = StormTransportSmoother01((progress - 0.095) / 0.57);
+	float seedClockD   = StormTransportSmoother01((progress - 0.145) / 0.55);
+	float reachA       = lerp(0.050, 0.58, seedClockA);
+	float reachB       = lerp(0.045, 0.56, seedClockB);
+	float reachC       = lerp(0.042, 0.57, seedClockC);
+	float reachD       = lerp(0.040, 0.55, seedClockD);
+	float carrierScale = lerp(1.18, 0.86, macro) * lerp(1.10, 0.90, lane);
+	float growthA      = 1.0 - smoothstep(max(reachA - 0.13, 0.0) * max(reachA - 0.13, 0.0), (reachA + 0.15) * (reachA + 0.15), metricA * carrierScale);
+	float growthB      = 1.0 - smoothstep(max(reachB - 0.12, 0.0) * max(reachB - 0.12, 0.0), (reachB + 0.15) * (reachB + 0.15), metricB * carrierScale);
+	float growthC      = 1.0 - smoothstep(max(reachC - 0.12, 0.0) * max(reachC - 0.12, 0.0), (reachC + 0.14) * (reachC + 0.14), metricC * carrierScale);
+	float growthD      = 1.0 - smoothstep(max(reachD - 0.11, 0.0) * max(reachD - 0.11, 0.0), (reachD + 0.14) * (reachD + 0.14), metricD * carrierScale);
+	float basinGrowth  = saturate(max(max(growthA, growthB), max(growthC, growthD)));
+
+	float corridorStart     = saturate(0.055 + (1.0 - lane) * 0.15 + (1.0 - macro) * 0.08 + (pulse - 0.5) * 0.04);
+	float corridorClock     = StormTransportSmoother01((progress - corridorStart) / 0.51);
+	float corridorMask      = smoothstep(0.25, 0.67, lane * 0.52 + macro * 0.31 + pulse * 0.17 + consolidationPulse * 0.16);
+	float horizontalGrowth  = saturate(max(basinGrowth, corridorClock * corridorMask));
+	float consolidationFill = StormTransportSmoother01((progress - 0.40) / 0.32) * localCondensation * lerp(0.92, 1.24, consolidationPulse);
+	horizontalGrowth        = saturate(max(horizontalGrowth, consolidationFill));
+
+	float verticalReach  = lerp(0.08, 1.18, pow(progress, 0.68)) + (towerNoise - 0.5) * 0.17 + flowUpdraft * 0.08 + consolidationPulse * flowUpdraft * 0.12;
+	float verticalGrowth = 1.0 - smoothstep(verticalReach - 0.18, verticalReach + 0.11, HLocal);
+
+	float coherentGrowth = saturate(localCondensation * horizontalGrowth * verticalGrowth * HeightInside * Domain.MatureColumn);
+	float endpointLock   = StormTransportSmoother01((progress - 0.84) / 0.16);
+	OutCondensation      = saturate(lerp(coherentGrowth, Domain.MatureColumn, endpointLock));
+}
+
+void StormBuildDissolutionTransport(FStormDomainSample Domain, float HLocal, float GlobalProgress, float RotationSign, float3 LFUVW, float3 HFUVW, float LFUnitsPerBodyRadius, float HFUnitsPerBodyRadius, out float3 OutLFUVW, out float3 OutHFUVW, out float OutSurvival)
+{
+	float  progress   = saturate(GlobalProgress);
+	float  handedness = RotationSign < 0.0 ? -1.0 : 1.0;
+	float  macro      = StormTransportMacro(Domain.BodyCoord, HLocal, 367.3);
+	float  detail     = StormTransportMacro(Domain.BodyCoord * 1.71, HLocal, 419.9);
+	float2 fieldWarp  = StormFormationFieldWarp(Domain.BodyCoord + float2(HLocal * 0.05, -HLocal * 0.04), HLocal, 463.7);
+	float  lane       = StormTransportLane(Domain.BodyCoord + fieldWarp * 0.08, HLocal);
+
+	float upper  = StormTransportSmoother01((HLocal - 0.10) / 0.82);
+	float outer  = StormTransportSmoother01((Domain.Radius01 - 0.20) / 0.80);
+	float middle = StormTransportSmoother01((HLocal - 0.08) / 0.30) * (1.0 - StormTransportSmoother01((HLocal - 0.86) / 0.18));
+
+	float motionClock = StormTransportSmoother01((progress - 0.02) / 0.86);
+	float peelClock   = StormTransportSmoother01((progress - 0.10) / 0.72);
+	float frontClock  = StormTransportSmoother01((progress - 0.05) / 0.88);
+
+	float maskAngle = -handedness * motionClock * lerp(0.10, 0.76, upper);
+	float maskSin;
+	float maskCos;
+	sincos(maskAngle, maskSin, maskCos);
+	float2 fixedReleaseAxis = normalize(float2(0.78, handedness * 0.63));
+	float2 releaseAxis      = float2(fixedReleaseAxis.x * maskCos - fixedReleaseAxis.y * maskSin, fixedReleaseAxis.x * maskSin + fixedReleaseAxis.y * maskCos);
+	float2 releaseTangent   = float2(-releaseAxis.y, releaseAxis.x);
+	float  sideCoordinate   = clamp(dot(Domain.BodyCoord, releaseAxis), -1.0, 1.0);
+	float  side01           = sideCoordinate * 0.5 + 0.5;
+	float  windward         = StormTransportSmoother01((side01 - 0.22) / 0.62);
+	float  trailing         = 1.0 - windward;
+
+	float2 axisDrift = -releaseAxis * motionClock * lerp(0.015, 0.052, upper) * lerp(0.97, 1.03, macro);
+
+	float coreWeight = 1.0 - StormTransportSmoother01((Domain.Radius01 - 0.10) / 0.78);
+	float twistAngle = handedness * motionClock * lerp(0.16, 0.98, upper) * lerp(0.93, 1.0, coreWeight) * lerp(0.99, 1.01, macro);
+	float twistSin;
+	float twistCos;
+	sincos(twistAngle, twistSin, twistCos);
+	float2 centeredBody = Domain.BodyCoord - axisDrift;
+	float2 twistedBody  = float2(centeredBody.x * twistCos - centeredBody.y * twistSin, centeredBody.x * twistSin + centeredBody.y * twistCos) + axisDrift;
+	float2 twistOffset  = twistedBody - Domain.BodyCoord;
+
+	float  radialLength    = max(length(centeredBody), 1.0e-4);
+	float2 radialDirection = centeredBody / radialLength;
+	float  peelPhase       = handedness * (HLocal - 0.48) * 0.92 + (macro - 0.5) * 0.20 + dot(fieldWarp, releaseTangent) * 0.08;
+	float  peelSin;
+	float  peelCos;
+	sincos(peelPhase, peelSin, peelCos);
+	float2 peelAxis        = float2(releaseAxis.x * peelCos - releaseAxis.y * peelSin, releaseAxis.x * peelSin + releaseAxis.y * peelCos);
+	float  peelAlignment   = dot(radialDirection, peelAxis);
+	float  peelArc         = smoothstep(0.66, 0.94, peelAlignment);
+	float  shellAccess     = StormTransportSmoother01((Domain.Radius01 - 0.27) / 0.43);
+	float  peelHead        = lerp(0.94, 0.10, peelClock);
+	float  peelPropagation = smoothstep(peelHead - 0.18, peelHead + 0.15, HLocal);
+	float  peelHeight      = StormTransportSmoother01((HLocal - 0.08) / 0.20) * (1.0 - StormTransportSmoother01((HLocal - 0.99) / 0.10));
+	float  peeledLayer     = peelArc * shellAccess * peelPropagation * peelHeight * lerp(0.82, 1.0, lane);
+
+	float2 peelDrift = releaseTangent * handedness * peelClock * peeledLayer * lerp(0.020, 0.085, upper);
+	peelDrift        += releaseAxis * peelClock * peeledLayer * lerp(0.012, 0.048, upper);
+
+	float2 spiralDrift = Domain.Tangent * handedness * motionClock * lerp(0.014, 0.108, upper) * lerp(0.95, 1.05, lane);
+	spiralDrift        += releaseAxis * motionClock * lerp(0.004, 0.034, upper) * lerp(0.82, 1.18, windward);
+	spiralDrift        += fieldWarp * motionClock * lerp(0.001, 0.003, upper);
+
+	float lfUnits = abs(LFUnitsPerBodyRadius);
+	float hfUnits = abs(HFUnitsPerBodyRadius);
+	OutLFUVW      = LFUVW;
+	OutHFUVW      = HFUVW;
+	OutLFUVW.xy   += (spiralDrift * 0.72 + twistOffset * 0.86 + peelDrift * 0.46) * lfUnits;
+	OutHFUVW.xy   += (spiralDrift * 0.78 + twistOffset * 0.90 + peelDrift * 0.58) * hfUnits;
+
+	float sideLift     = lerp(0.82, 1.18, windward);
+	float liftDistance = motionClock * lerp(0.025, 0.190, upper) * sideLift * lerp(0.97, 1.03, macro);
+	float peelLift     = peelClock * peeledLayer * lerp(0.012, 0.075, upper);
+	OutLFUVW.z         -= (liftDistance * 0.66 + peelLift * 0.44) * lfUnits;
+	OutHFUVW.z         -= (liftDistance * 0.72 + peelLift * 0.54) * hfUnits;
+
+	float frontWarp    = (macro - 0.5) * 0.045 + (detail - 0.5) * 0.020 + (lane - 0.5) * 0.018 + dot(fieldWarp, releaseAxis) * 0.012;
+	float lowerFront   = lerp(-0.32, 0.93, frontClock) + sideCoordinate * frontClock * 0.12 + frontWarp * lerp(0.22, 0.54, frontClock);
+	float frontFeather = lerp(0.255, 0.175, frontClock);
+	float baseSupport  = smoothstep(lowerFront - frontFeather, lowerFront + frontFeather * 0.82, HLocal);
+
+	float peelSupport     = saturate(1.0 - peeledLayer * peelClock * lerp(0.50, 0.82, outer));
+	float shoulderLoss    = outer * saturate(middle * 0.60 + upper * 0.40) * windward;
+	float shoulderSupport = saturate(1.0 - peelClock * shoulderLoss * 0.30);
+
+	float streamerPhase = peelPhase - handedness * 0.48;
+	float streamerSin;
+	float streamerCos;
+	sincos(streamerPhase, streamerSin, streamerCos);
+	float2 streamerAxis     = float2(releaseAxis.x * streamerCos - releaseAxis.y * streamerSin, releaseAxis.x * streamerSin + releaseAxis.y * streamerCos);
+	float  streamerArc      = smoothstep(0.70, 0.94, dot(radialDirection, streamerAxis));
+	float  trailingStreamer = streamerArc * shellAccess * middle * trailing * lerp(0.76, 1.0, lane);
+
+	float evaporationStart      = 0.585 - windward * 0.040 + trailingStreamer * 0.030 + (macro - 0.5) * 0.018;
+	evaporationStart            = clamp(evaporationStart, 0.53, 0.65);
+	float evaporationEnd        = min(0.992, 0.976 + trailingStreamer * 0.012 + (detail - 0.5) * 0.006);
+	float continuousEvaporation = 1.0 - StormTransportSmoother01((progress - evaporationStart) / max(evaporationEnd - evaporationStart, 0.30));
+
+	OutSurvival = saturate(baseSupport * peelSupport * shoulderSupport * continuousEvaporation);
+}

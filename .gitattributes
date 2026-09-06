@@ -1,0 +1,16 @@
+* text=auto
+*.cpp text
+*.h   text
+*.hpp text
+*.cs  text
+*.usf text
+*.ush text
+*.ini text
+*.uproject text
+*.uplugin  text
+*.uasset binary
+*.umap   binary
+*.png binary
+*.tga binary
+*.dds binary
+*.exr binary

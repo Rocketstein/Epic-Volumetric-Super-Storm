@@ -1,0 +1,31 @@
+/**
+ * @file StormCoordinates.ush
+ * @brief Converts world, body, and texture coordinates used by storm shaders.
+ */
+
+#pragma once
+
+float2 StormSafeHalfExtent(float2 FieldHalfExtentCm)
+{
+	return max(abs(FieldHalfExtentCm), float2(1.0, 1.0));
+}
+
+float2 StormFieldUVToLocalCm(float2 FieldUV, float2 FieldHalfExtentCm)
+{
+	return (FieldUV * 2.0 - 1.0) * StormSafeHalfExtent(FieldHalfExtentCm);
+}
+
+float2 StormLocalCmToBodyCoord(float2 StormLocalCm, float BodyRadiusCm)
+{
+	return StormLocalCm / max(abs(BodyRadiusCm), 1.0);
+}
+
+float2 StormWorldPositionToBodyCoord(float3 WorldPosition, float3 StormCenterRadius)
+{
+	return (WorldPosition.xy - StormCenterRadius.xy) / max(abs(StormCenterRadius.z), 1.0);
+}
+
+float2 StormBodyCoordToCanonicalShapeUV(float2 BodyCoord)
+{
+	return BodyCoord * 0.5 + 0.5;
+}
