@@ -7,8 +7,8 @@
 <p align="center">
   <a href="https://www.fab.com/listings/1c2d0fea-7278-49f0-9559-3efef3076ac0"><img alt="Available on Fab" src="https://img.shields.io/badge/Fab-View%20Listing-000000?style=flat-square"></a>
   <img alt="Unreal Engine 5.8" src="https://img.shields.io/badge/Unreal%20Engine-5.8-0E1128?style=flat-square&logo=unrealengine">
-  <img alt="DirectX 12" src="https://img.shields.io/badge/DirectX-12-107C10?style=flat-square">
-  <img alt="Shader Model 6" src="https://img.shields.io/badge/Shader%20Model-6-5C2D91?style=flat-square">
+  <img alt="DirectX 12" src="https://img.shields.io/badge/DirectX-11-107C10?style=flat-square">
+  <img alt="Shader Model 5" src="https://img.shields.io/badge/Shader%20Model-6-5C2D91?style=flat-square">
 </p>
 
 ## Overview
