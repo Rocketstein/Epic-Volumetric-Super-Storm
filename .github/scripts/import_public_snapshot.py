@@ -1,56 +1,86 @@
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import shutil
+import stat
 import tarfile
 import tempfile
+import urllib.parse
+import urllib.request
+import zipfile
 from pathlib import Path, PurePosixPath
 
 repo = Path.cwd().resolve()
-transfer = repo / ".public_export"
-manifest_path = transfer / "manifest.json"
-ready_path = transfer / "READY"
+request_path = repo / ".public_import/request.json"
+if not request_path.is_file():
+    raise RuntimeError("Missing .public_import/request.json")
+request = json.loads(request_path.read_text(encoding="utf-8"))
 
-if not manifest_path.is_file() or not ready_path.is_file():
-    raise RuntimeError("Transfer package is incomplete: manifest.json and READY are required")
+url = str(request["download_url"])
+parsed = urllib.parse.urlparse(url)
+if parsed.scheme != "https" or not parsed.hostname or not parsed.hostname.endswith(
+    ".oaiusercontent.com"
+):
+    raise RuntimeError("Snapshot URL is not an approved one-time artifact URL")
 
-manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-chunk_count = int(manifest["chunk_count"])
-chunks = sorted(transfer.glob("chunk-*.b64"))
-if len(chunks) != chunk_count:
-    raise RuntimeError(f"Expected {chunk_count} chunks, found {len(chunks)}")
 
-encoded = "".join(path.read_text(encoding="ascii").strip() for path in chunks)
-if len(encoded) != int(manifest["base64_characters"]):
-    raise RuntimeError("Base64 payload length does not match manifest")
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
-archive_bytes = base64.b64decode(encoded, validate=True)
-actual_hash = hashlib.sha256(archive_bytes).hexdigest()
-expected_hash = str(manifest["archive_sha256"])
-if actual_hash != expected_hash:
-    raise RuntimeError(f"Archive SHA-256 mismatch: {actual_hash} != {expected_hash}")
-if ready_path.read_text(encoding="ascii").strip() != expected_hash:
-    raise RuntimeError("READY marker does not match archive hash")
-if len(archive_bytes) != int(manifest["archive_bytes"]):
-    raise RuntimeError("Archive byte length does not match manifest")
 
 with tempfile.TemporaryDirectory(prefix="vss-public-import-") as temporary:
     temp = Path(temporary)
-    archive_path = temp / "snapshot.tar.gz"
+    artifact_zip = temp / "artifact.zip"
+    archive_path = temp / "public-snapshot.tar.gz"
     extracted = temp / "extracted"
-    archive_path.write_bytes(archive_bytes)
     extracted.mkdir()
 
-    with tarfile.open(archive_path, "r:gz") as tar:
-        for member in tar.getmembers():
+    http_request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Volumetric-Super-Storm-public-import"},
+    )
+    with urllib.request.urlopen(http_request, timeout=120) as response:
+        with artifact_zip.open("wb") as output:
+            shutil.copyfileobj(response, output)
+
+    if artifact_zip.stat().st_size != int(request["zip_bytes"]):
+        raise RuntimeError("Artifact ZIP size mismatch")
+    if sha256(artifact_zip) != str(request["zip_sha256"]):
+        raise RuntimeError("Artifact ZIP SHA-256 mismatch")
+
+    with zipfile.ZipFile(artifact_zip) as artifact:
+        files = [member for member in artifact.infolist() if not member.is_dir()]
+        if len(files) != 1 or PurePosixPath(files[0].filename).name != "public-snapshot.tar.gz":
+            raise RuntimeError("Artifact ZIP must contain only public-snapshot.tar.gz")
+        member = files[0]
+        member_path = PurePosixPath(member.filename)
+        if member_path.is_absolute() or ".." in member_path.parts:
+            raise RuntimeError("Unsafe artifact ZIP path")
+        mode = member.external_attr >> 16
+        if stat.S_ISLNK(mode):
+            raise RuntimeError("Symlinks are not allowed in artifact ZIP")
+        with artifact.open(member) as source, archive_path.open("wb") as output:
+            shutil.copyfileobj(source, output)
+
+    if archive_path.stat().st_size != int(request["archive_bytes"]):
+        raise RuntimeError("Snapshot archive size mismatch")
+    expected_archive_hash = str(request["archive_sha256"])
+    if sha256(archive_path) != expected_archive_hash:
+        raise RuntimeError("Snapshot archive SHA-256 mismatch")
+
+    with tarfile.open(archive_path, "r:gz") as archive:
+        for member in archive.getmembers():
             name = PurePosixPath(member.name)
             if name.is_absolute() or ".." in name.parts:
-                raise RuntimeError(f"Unsafe archive path: {member.name}")
+                raise RuntimeError(f"Unsafe snapshot path: {member.name}")
             if member.issym() or member.islnk() or member.isdev():
-                raise RuntimeError(f"Unsafe archive member type: {member.name}")
-        tar.extractall(extracted, filter="data")
+                raise RuntimeError(f"Unsafe snapshot member: {member.name}")
+        archive.extractall(extracted, filter="data")
 
     required = {
         Path(".codex_tmp"),
@@ -63,7 +93,7 @@ with tempfile.TemporaryDirectory(prefix="vss-public-import-") as temporary:
     }
     for relative in required:
         if not (extracted / relative).exists():
-            raise RuntimeError(f"Required extracted path is missing: {relative}")
+            raise RuntimeError(f"Required snapshot path is missing: {relative}")
 
     banned = {
         Path("Content"),
@@ -73,21 +103,24 @@ with tempfile.TemporaryDirectory(prefix="vss-public-import-") as temporary:
         Path("Plugins/VolumetricSuperStorm/README.md"),
         Path("Plugins/VolumetricSuperStorm/CHANGELOG.md"),
         Path("Plugins/VolumetricSuperStorm/CREDITS.md"),
+        Path("Plugins/VolumetricSuperStorm/Config/FilterPlugin.ini"),
         Path("README.md"),
         Path(".github"),
+        Path(".public_import"),
         Path(".public_export"),
     }
     for relative in banned:
         if (extracted / relative).exists():
-            raise RuntimeError(f"Banned extracted path survived: {relative}")
+            raise RuntimeError(f"Banned snapshot path survived: {relative}")
 
     extracted_files = [path for path in extracted.rglob("*") if path.is_file()]
-    if len(extracted_files) != int(manifest["file_count"]):
-        raise RuntimeError("Extracted file count does not match manifest")
-    if sum(path.stat().st_size for path in extracted_files) != int(manifest["payload_bytes"]):
-        raise RuntimeError("Extracted payload size does not match manifest")
+    if len(extracted_files) != int(request["file_count"]):
+        raise RuntimeError("Snapshot file count mismatch")
+    if sum(path.stat().st_size for path in extracted_files) != int(
+        request["payload_bytes"]
+    ):
+        raise RuntimeError("Snapshot payload size mismatch")
 
-    # Replace the branch worktree wholesale while preserving only Git metadata.
     for existing in repo.iterdir():
         if existing.name == ".git":
             continue
@@ -102,9 +135,9 @@ with tempfile.TemporaryDirectory(prefix="vss-public-import-") as temporary:
 print(
     json.dumps(
         {
-            "archive_sha256": expected_hash,
-            "file_count": manifest["file_count"],
-            "payload_bytes": manifest["payload_bytes"],
+            "archive_sha256": expected_archive_hash,
+            "file_count": request["file_count"],
+            "payload_bytes": request["payload_bytes"],
         },
         indent=2,
     )
