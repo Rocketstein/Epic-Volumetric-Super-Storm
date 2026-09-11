@@ -1,0 +1,89 @@
+﻿{
+	"devices": [
+		{
+			"deviceName": "DESKTOP-N8H5EB1",
+			"instance": "77391C494050828E8F69189C4DEB608C",
+			"instanceName": "DESKTOP-N8H5EB1-29960",
+			"platform": "WindowsEditor",
+			"oSVersion": "Windows 11 (25H2) [10.0.26200.8894] ",
+			"model": "Default",
+			"gPU": "NVIDIA GeForce RTX 5060",
+			"cPUModel": "Intel(R) Core(TM) i7-14700",
+			"rAMInGB": 32,
+			"renderMode": "SM6",
+			"rHI": "",
+			"appInstanceLog": ""
+		}
+	],
+	"reportCreatedOn": "2026.07.27-11.48.32",
+	"succeeded": 4,
+	"succeededWithWarnings": 0,
+	"failed": 0,
+	"notRun": 0,
+	"inProcess": 0,
+	"totalDuration": 0.032990604639053345,
+	"comparisonExported": false,
+	"comparisonExportDirectory": "",
+	"tests": [
+		{
+			"testDisplayName": "ArraySynchronization",
+			"fullTestPath": "SavageSuperStorm.Motion.Rings.ArraySynchronization",
+			"tags": [],
+			"state": "Success",
+			"deviceInstance": [
+				"77391C494050828E8F69189C4DEB608C"
+			],
+			"duration": 0.0078563988208770752,
+			"dateTime": "2026.07.27-11.48.32",
+			"entries": [],
+			"warnings": 0,
+			"errors": 0,
+			"artifacts": []
+		},
+		{
+			"testDisplayName": "OuterBrimNormalization",
+			"fullTestPath": "SavageSuperStorm.Motion.Rings.OuterBrimNormalization",
+			"tags": [],
+			"state": "Success",
+			"deviceInstance": [
+				"77391C494050828E8F69189C4DEB608C"
+			],
+			"duration": 0.0085988007485866547,
+			"dateTime": "2026.07.27-11.48.32",
+			"entries": [],
+			"warnings": 0,
+			"errors": 0,
+			"artifacts": []
+		},
+		{
+			"testDisplayName": "SanitizeContract",
+			"fullTestPath": "SavageSuperStorm.Motion.Rings.SanitizeContract",
+			"tags": [],
+			"state": "Success",
+			"deviceInstance": [
+				"77391C494050828E8F69189C4DEB608C"
+			],
+			"duration": 0.0083818025887012482,
+			"dateTime": "2026.07.27-11.48.32",
+			"entries": [],
+			"warnings": 0,
+			"errors": 0,
+			"artifacts": []
+		},
+		{
+			"testDisplayName": "ShaderActiveCountContract",
+			"fullTestPath": "SavageSuperStorm.Motion.Rings.ShaderActiveCountContract",
+			"tags": [],
+			"state": "Success",
+			"deviceInstance": [
+				"77391C494050828E8F69189C4DEB608C"
+			],
+			"duration": 0.0081536024808883667,
+			"dateTime": "2026.07.27-11.48.32",
+			"entries": [],
+			"warnings": 0,
+			"errors": 0,
+			"artifacts": []
+		}
+	]
+}

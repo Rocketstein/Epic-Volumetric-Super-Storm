@@ -1,0 +1,104 @@
+﻿{
+	"devices": [
+		{
+			"deviceName": "DESKTOP-N8H5EB1",
+			"instance": "BC363CA844F6436979FBBC83716A8E94",
+			"instanceName": "DESKTOP-N8H5EB1-2328",
+			"platform": "WindowsEditor",
+			"oSVersion": "Windows 11 (25H2) [10.0.26200.8894] ",
+			"model": "Default",
+			"gPU": "NVIDIA GeForce RTX 5060",
+			"cPUModel": "Intel(R) Core(TM) i7-14700",
+			"rAMInGB": 32,
+			"renderMode": "D3D12_SM6",
+			"rHI": "D3D12 (SM6)",
+			"appInstanceLog": ""
+		}
+	],
+	"reportCreatedOn": "2026.07.28-06.16.15",
+	"succeeded": 5,
+	"succeededWithWarnings": 0,
+	"failed": 0,
+	"notRun": 0,
+	"inProcess": 0,
+	"totalDuration": 23.245304107666016,
+	"comparisonExported": false,
+	"comparisonExportDirectory": "",
+	"tests": [
+		{
+			"testDisplayName": "CoverageAndDensityUnion",
+			"fullTestPath": "SavageSuperStorm.Density.Anvil.CoverageAndDensityUnion",
+			"tags": [],
+			"state": "Success",
+			"deviceInstance": [
+				"BC363CA844F6436979FBBC83716A8E94"
+			],
+			"duration": 0.0076907984912395477,
+			"dateTime": "2026.07.28-06.15.51",
+			"entries": [],
+			"warnings": 0,
+			"errors": 0,
+			"artifacts": []
+		},
+		{
+			"testDisplayName": "DisabledIdentityBaseline",
+			"fullTestPath": "SavageSuperStorm.Density.Anvil.DisabledIdentityBaseline",
+			"tags": [],
+			"state": "Success",
+			"deviceInstance": [
+				"BC363CA844F6436979FBBC83716A8E94"
+			],
+			"duration": 0.0078865997493267059,
+			"dateTime": "2026.07.28-06.15.52",
+			"entries": [],
+			"warnings": 0,
+			"errors": 0,
+			"artifacts": []
+		},
+		{
+			"testDisplayName": "HeightTwist",
+			"fullTestPath": "SavageSuperStorm.Density.Anvil.HeightTwist",
+			"tags": [],
+			"state": "Success",
+			"deviceInstance": [
+				"BC363CA844F6436979FBBC83716A8E94"
+			],
+			"duration": 0.0081000030040740967,
+			"dateTime": "2026.07.28-06.15.52",
+			"entries": [],
+			"warnings": 0,
+			"errors": 0,
+			"artifacts": []
+		},
+		{
+			"testDisplayName": "MSSSCompile",
+			"fullTestPath": "SavageSuperStorm.Density.Material.MSSSCompile",
+			"tags": [],
+			"state": "Success",
+			"deviceInstance": [
+				"BC363CA844F6436979FBBC83716A8E94"
+			],
+			"duration": 23.205783843994141,
+			"dateTime": "2026.07.28-06.15.52",
+			"entries": [],
+			"warnings": 0,
+			"errors": 0,
+			"artifacts": []
+		},
+		{
+			"testDisplayName": "ActiveOwnership",
+			"fullTestPath": "SavageSuperStorm.Density.Spiral.V16.ActiveOwnership",
+			"tags": [],
+			"state": "Success",
+			"deviceInstance": [
+				"BC363CA844F6436979FBBC83716A8E94"
+			],
+			"duration": 0.015842601656913757,
+			"dateTime": "2026.07.28-06.16.15",
+			"entries": [],
+			"warnings": 0,
+			"errors": 0,
+			"artifacts": []
+		}
+	]
+}

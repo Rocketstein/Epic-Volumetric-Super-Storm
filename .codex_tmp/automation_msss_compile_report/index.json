@@ -1,0 +1,81 @@
+﻿{
+	"devices": [
+		{
+			"deviceName": "DESKTOP-N8H5EB1",
+			"instance": "41748B49409F8B121B4912932ACEACB0",
+			"instanceName": "DESKTOP-N8H5EB1-33892",
+			"platform": "WindowsEditor",
+			"oSVersion": "Windows 11 (25H2) [10.0.26200.8894] ",
+			"model": "Default",
+			"gPU": "NVIDIA GeForce RTX 5060",
+			"cPUModel": "Intel(R) Core(TM) i7-14700",
+			"rAMInGB": 32,
+			"renderMode": "SM6",
+			"rHI": "",
+			"appInstanceLog": ""
+		}
+	],
+	"reportCreatedOn": "2026.07.27-11.46.49",
+	"succeeded": 0,
+	"succeededWithWarnings": 0,
+	"failed": 1,
+	"notRun": 0,
+	"inProcess": 0,
+	"totalDuration": 0.063358500599861145,
+	"comparisonExported": false,
+	"comparisonExportDirectory": "",
+	"tests": [
+		{
+			"testDisplayName": "MSSSCompile",
+			"fullTestPath": "SavageSuperStorm.Density.Material.MSSSCompile",
+			"tags": [],
+			"state": "Fail",
+			"deviceInstance": [
+				"41748B49409F8B121B4912932ACEACB0"
+			],
+			"duration": 0.063358500599861145,
+			"dateTime": "2026.07.27-11.46.49",
+			"entries": [
+				{
+					"event":
+					{
+						"type": "Info",
+						"message": "LogStreaming: FlushAsyncLoading(498): 1 QueuedPackages, 0 AsyncPackages",
+						"context": "log",
+						"artifact": "00000000000000000000000000000000"
+					},
+					"filename": "",
+					"lineNumber": -1,
+					"timestamp": "2026.07.27-11.46.49"
+				},
+				{
+					"event":
+					{
+						"type": "Error",
+						"message": "Expected 'M_SSS has a material resource' to be not null.",
+						"context": "",
+						"artifact": "00000000000000000000000000000000"
+					},
+					"filename": "C:\\Users\\jungle\\Perforce\\CptTangerine_Workspace\\VolumetricSuperStorm\\Plugins\\SavageSuperStorm\\Source\\SavageSuperStormRuntime\\Private\\Tests\\StormDensityContractTests.cpp",
+					"lineNumber": 2431,
+					"timestamp": "2026.07.27-11.46.49"
+				},
+				{
+					"event":
+					{
+						"type": "Error",
+						"message": "Expected 'M_SSS_RedGlow_V2_Motion has a material resource' to be not null.",
+						"context": "",
+						"artifact": "00000000000000000000000000000000"
+					},
+					"filename": "C:\\Users\\jungle\\Perforce\\CptTangerine_Workspace\\VolumetricSuperStorm\\Plugins\\SavageSuperStorm\\Source\\SavageSuperStormRuntime\\Private\\Tests\\StormDensityContractTests.cpp",
+					"lineNumber": 2431,
+					"timestamp": "2026.07.27-11.46.49"
+				}
+			],
+			"warnings": 0,
+			"errors": 2,
+			"artifacts": []
+		}
+	]
+}

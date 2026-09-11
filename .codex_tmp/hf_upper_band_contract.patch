@@ -1,0 +1,79 @@
+diff --git a/Plugins/SavageSuperStorm/Shaders/Public/StormDensityField.ush b/Plugins/SavageSuperStorm/Shaders/Public/StormDensityField.ush
+--- a/Plugins/SavageSuperStorm/Shaders/Public/StormDensityField.ush
++++ b/Plugins/SavageSuperStorm/Shaders/Public/StormDensityField.ush
+@@ -106,11 +106,13 @@ float StormEvaluateHeightAwareHFStrength(
+     float HFStrengthAnvil)
+ {
+     // HFStrength is the global master. HFStrengthAnvil is a relative boost
+-    // toward the upper column, so a zero master disables HF at every height.
++    // inside the actual upper band, so it cannot leak into the Type-0 shelf.
++    // A zero master disables HF at every height.
+     float masterStrength = saturate(HFStrength);
+     float upperBoost = saturate(HFStrengthAnvil);
++    float upperMask = smoothstep(0.70, 1.0, saturate(HLocal));
+     return saturate(
+-        masterStrength * (1.0 + upperBoost * saturate(HLocal)));
++        masterStrength * (1.0 + upperBoost * upperMask));
+ }
+ 
+ float StormEvaluateHFErosionThreshold(
+diff --git a/Plugins/SavageSuperStorm/Source/SavageSuperStormRuntime/Public/Field/StormDensityContract.h b/Plugins/SavageSuperStorm/Source/SavageSuperStormRuntime/Public/Field/StormDensityContract.h
+--- a/Plugins/SavageSuperStorm/Source/SavageSuperStormRuntime/Public/Field/StormDensityContract.h
++++ b/Plugins/SavageSuperStorm/Source/SavageSuperStormRuntime/Public/Field/StormDensityContract.h
+@@ -284,13 +284,15 @@ inline float EvaluateHeightAwareHFStrength(
+     float HFStrengthAnvil)
+ {
+     // HFStrength is the global master. HFStrengthAnvil is a relative boost
+-    // toward the upper column, so a zero master disables HF at every height.
++    // inside the actual upper band, so it cannot leak into the Type-0 shelf.
++    // A zero master disables HF at every height.
+     const float MasterStrength = FMath::Clamp(HFStrength, 0.0f, 1.0f);
+     const float UpperBoost = FMath::Clamp(HFStrengthAnvil, 0.0f, 1.0f);
++    const float UpperMask = FMath::SmoothStep(
++        0.70f, 1.0f, FMath::Clamp(HLocal, 0.0f, 1.0f));
+     return FMath::Clamp(
+-        MasterStrength
+-            * (1.0f + UpperBoost * FMath::Clamp(HLocal, 0.0f, 1.0f)),
++        MasterStrength * (1.0f + UpperBoost * UpperMask),
+         0.0f,
+         1.0f);
+ }
+diff --git a/Plugins/SavageSuperStorm/Source/SavageSuperStormRuntime/Private/Tests/StormDensityContractTests.cpp b/Plugins/SavageSuperStorm/Source/SavageSuperStormRuntime/Private/Tests/StormDensityContractTests.cpp
+--- a/Plugins/SavageSuperStorm/Source/SavageSuperStormRuntime/Private/Tests/StormDensityContractTests.cpp
++++ b/Plugins/SavageSuperStorm/Source/SavageSuperStormRuntime/Private/Tests/StormDensityContractTests.cpp
+@@ -264,14 +264,18 @@ bool FStormDensityNoiseContractTest::RunTest(const FString& Parameters)
+     TestTrue(TEXT("HF strength rises continuously toward the top"),
+         EvaluateHeightAwareHFStrength(0.9f, 0.25f, 0.55f)
+             > EvaluateHeightAwareHFStrength(0.1f, 0.25f, 0.55f));
+-    TestTrue(TEXT("HF strength no longer has a TopType center gate"),
++    TestTrue(TEXT("Anvil boost stays outside the lower and middle column"),
+         FMath::IsNearlyEqual(
+             EvaluateHeightAwareHFStrength(0.45f, 0.25f, 0.55f),
+-            0.311875f,
++            0.25f,
+             1.0e-6f));
+-    TestEqual(TEXT("Zero master disables HF even with a nonzero anvil boost"),
+-        EvaluateHeightAwareHFStrength(0.90f, 0.0f, 1.0f), 0.0f);
++    TestEqual(TEXT("Zero master disables HF at the Type-0 shelf bottom"),
++        EvaluateHeightAwareHFStrength(0.10f, 0.0f, 1.0f), 0.0f);
++    TestEqual(TEXT("Zero master disables HF at the Type-0 shelf top"),
++        EvaluateHeightAwareHFStrength(0.18f, 0.0f, 1.0f), 0.0f);
++    TestEqual(TEXT("Type-0 shelf strength is exactly the global master"),
++        EvaluateHeightAwareHFStrength(0.18f, 0.25f, 1.0f), 0.25f);
+     TestTrue(TEXT("Anvil strength is a relative upper-column boost"),
+         FMath::IsNearlyEqual(
+             EvaluateHeightAwareHFStrength(1.0f, 0.25f, 0.55f),
+@@ -350,11 +354,11 @@ bool FStormDensityNoiseContractTest::RunTest(const FString& Parameters)
+         0.55f,
+         0.55f);
+     TestTrue(TEXT("Density-field HF produces the expected NoiseComposite"),
+-        FMath::IsNearlyEqual(RepresentativeNoise, 0.5212734f, 1.0e-6f));
++        FMath::IsNearlyEqual(RepresentativeNoise, 0.5267309f, 1.0e-6f));
+     TestTrue(TEXT("The density-field composite survives the canonical profile threshold"),
+         FMath::IsNearlyEqual(
+             EvaluateDensity(RepresentativeNoise, 0.70f, 1.0f),
+-            0.2212734f,
++            0.2267309f,
+             1.0e-6f));
+ 
+     const float StratusNoise = EvaluateNoiseCompositeFromSamples(

@@ -1,0 +1,330 @@
+diff --git a/Plugins/SavageSuperStorm/Shaders/Public/StormDensityField.ush b/Plugins/SavageSuperStorm/Shaders/Public/StormDensityField.ush
+--- a/Plugins/SavageSuperStorm/Shaders/Public/StormDensityField.ush
++++ b/Plugins/SavageSuperStorm/Shaders/Public/StormDensityField.ush
+@@ -16,6 +16,15 @@
+ // control from turning geometry-agnostic LF minima into large interior holes.
+ static const float STORM_HF_EROSION_BUDGET = 0.20;
+ 
++// The default Type-0 profile is thinner than the combined bottom/top fade
++// widths, so its two LUT ramps overlap without ever reaching one. Treat the
++// small non-zero lobe as a thin occupied layer, while keeping exact LUT zeroes
++// empty. HF moves only the lower ramp threshold; it cannot excavate a hole
++// once the bottom mask has reached one.
++static const float STORM_STRATUS_PROFILE_RESIDUAL = 0.025;
++static const float STORM_STRATUS_PROFILE_SOLID = 0.125;
++static const float STORM_STRATUS_BASE_EROSION_BUDGET = 0.20;
++
+ struct FStormHeightSample
+ {
+     float MinH01;
+@@ -262,6 +271,44 @@ float StormEvaluateProfilePair(
+     return saturate(bottomProfile * topProfile);
+ }
+ 
++float StormEvaluateThinStratusMask(float ProfileMask, float ThresholdShift)
++{
++    float shift = max(ThresholdShift, 0.0);
++    return smoothstep(
++        STORM_STRATUS_PROFILE_RESIDUAL + shift,
++        STORM_STRATUS_PROFILE_SOLID + shift,
++        saturate(ProfileMask));
++}
++
++float StormEvaluateStratusNormalProfile(
++    float BottomProfile,
++    float TopProfile,
++    float TopType,
++    float HFErosionModifier,
++    float EffectiveHFStrength)
++{
++    float rawProfile = saturate(BottomProfile * TopProfile);
++
++    // Type 0 is the thin stratus anchor. By Type 0.5 the authored LUT already
++    // has a full-density overlap, so blend back to the untouched profile.
++    float stratusWeight = 1.0 - smoothstep(
++        0.0, 0.5, saturate(TopType));
++    float bottomThresholdShift = saturate(HFErosionModifier)
++        * saturate(EffectiveHFStrength)
++        * STORM_STRATUS_BASE_EROSION_BUDGET
++        * stratusWeight;
++
++    float thinBottom = StormEvaluateThinStratusMask(
++        BottomProfile, bottomThresholdShift);
++    float thinTop = StormEvaluateThinStratusMask(TopProfile, 0.0);
++    float thinProfile = saturate(thinBottom * thinTop);
++
++    // This is a profile remap, never a density floor: a zero bottom or top LUT
++    // sample remains zero, and an established interior sample remains one.
++    return saturate(lerp(rawProfile, thinProfile, stratusWeight));
++}
++
+ 
+ float StormEvaluateNormalProfile(
+     Texture2D BottomProfileTex,
+@@ -270,18 +317,32 @@ float StormEvaluateNormalProfile(
+     SamplerState TopProfileSampler,
+     float HLocal,
+     float BottomType,
+-    float TopType)
++    float TopType,
++    float HFErosionModifier,
++    float EffectiveHFStrength)
+ {
+     // Normal profile is sampled bottom-to-top by reversing local height.
+     float vNormal = 1.0 - saturate(HLocal);
+-    return StormEvaluateProfilePair(
+-        BottomProfileTex,
+-        BottomProfileSampler,
+-        TopProfileTex,
+-        TopProfileSampler,
++    float2 bottomUV = StormClampProfileUV(
++        BottomProfileTex, BottomType, vNormal);
++    float2 topUV = StormClampProfileUV(
++        TopProfileTex, TopType, vNormal);
++    float bottomProfile = saturate(Texture2DSampleLevel(
++        BottomProfileTex,
++        BottomProfileSampler,
++        bottomUV,
++        0).r);
++    float topProfile = saturate(Texture2DSampleLevel(
++        TopProfileTex,
++        TopProfileSampler,
++        topUV,
++        0).r);
++    return StormEvaluateStratusNormalProfile(
++        bottomProfile,
++        topProfile,
+         BottomType,
+         TopType,
+-        vNormal);
++        HFErosionModifier,
++        EffectiveHFStrength);
+ }
+ 
+ FStormAnvilProfileResult StormEvaluateFlippedAnvilProfile(
+@@ -337,7 +398,9 @@ float StormEvaluateDimensionalProfile(
+     float AnvilFeather,
+     float AnvilTopFadeDepth,
+     float AnvilProfileCompression,
+-    float AnvilStrength)
++    float AnvilStrength,
++    float HFErosionModifier,
++    float EffectiveHFStrength)
+ {
+     float normalProfile = StormEvaluateNormalProfile(
+         BottomProfileTex,
+@@ -346,7 +409,9 @@ float StormEvaluateDimensionalProfile(
+         TopProfileSampler,
+         HLocal,
+         BottomType,
+-        TopType);
++        TopType,
++        HFErosionModifier,
++        EffectiveHFStrength);
+     FStormAnvilProfileResult anvil = StormEvaluateFlippedAnvilProfile(
+         BottomProfileTex,
+         BottomProfileSampler,
+diff --git a/Plugins/SavageSuperStorm/Shaders/Public/StormDensityMaterialAdapter.ush b/Plugins/SavageSuperStorm/Shaders/Public/StormDensityMaterialAdapter.ush
+--- a/Plugins/SavageSuperStorm/Shaders/Public/StormDensityMaterialAdapter.ush
++++ b/Plugins/SavageSuperStorm/Shaders/Public/StormDensityMaterialAdapter.ush
+@@ -6,7 +6,14 @@
+ // adapter in USH makes the graph a wiring layer while the density contract and
+ // noise morphology remain shared shader code.
+-float StormEvaluateNoiseCompositeUVW(
++struct FStormMaterialNoiseResult
++{
++    float NoiseComposite;
++    float HFErosionModifier;
++    float EffectiveHFStrength;
++};
++
++FStormMaterialNoiseResult StormEvaluateNoiseCompositeUVW(
+     Texture3D LFNoiseTex,
+     SamplerState LFNoiseSampler,
+     Texture3D HFNoiseTex,
+@@ -25,6 +32,7 @@ float StormEvaluateNoiseCompositeUVW(
+     float HFStrength,
+     float HFStrengthAnvil)
+ {
++    FStormMaterialNoiseResult result;
+     float2 curlUV = frac(LFUVW.xy * max(abs(CurlTiling), 1.0e-3));
+     float2 curlVector = Texture2DSampleLevel(
+         CurlNoiseTex, CurlNoiseSampler, curlUV, 0).rg * 2.0 - 1.0;
+@@ -60,7 +68,12 @@ float StormEvaluateNoiseCompositeUVW(
+     float erosionLowerBound = StormEvaluateHFErosionLowerBound(
+         hfMorphology.HFErosionModifier,
+         effectiveHFStrength);
+-    return StormEvaluateBaseCloudDensity(lfShape, erosionLowerBound);
++    result.NoiseComposite = StormEvaluateBaseCloudDensity(
++        lfShape, erosionLowerBound);
++    result.HFErosionModifier = hfMorphology.HFErosionModifier;
++    result.EffectiveHFStrength = effectiveHFStrength;
++    return result;
+ }
+ 
+ float StormEvaluateMaterialDensity(
+@@ -96,6 +109,25 @@ float StormEvaluateMaterialDensity(
+     float heightInside = step(1.0e-4, h)
+         * step(h, 1.0 - 1.0e-4);
+ 
++    FStormMaterialNoiseResult noise = StormEvaluateNoiseCompositeUVW(
++        LFNoiseTex,
++        LFNoiseSampler,
++        HFNoiseTex,
++        HFNoiseSampler,
++        CurlNoiseTex,
++        CurlNoiseSampler,
++        LFUVW,
++        HFUVW,
++        CurlTiling,
++        CurlDisplacementUVW,
++        LFMacroMax,
++        h,
++        BottomType,
++        TopType,
++        BottomWispyStrength,
++        HFStrength,
++        HFStrengthAnvil);
++
+     float verticalProfile = StormEvaluateDimensionalProfile(
+         BottomProfileTex,
+         BottomProfileSampler,
+@@ -109,28 +141,14 @@ float StormEvaluateMaterialDensity(
+         0.04,
+         0.06,
+         0.92,
+-        AnvilStrength);
+-
+-    float normalNoise = StormEvaluateNoiseCompositeUVW(
+-        LFNoiseTex,
+-        LFNoiseSampler,
+-        HFNoiseTex,
+-        HFNoiseSampler,
+-        CurlNoiseTex,
+-        CurlNoiseSampler,
+-        LFUVW,
+-        HFUVW,
+-        CurlTiling,
+-        CurlDisplacementUVW,
+-        LFMacroMax,
+-        h,
+-        BottomType,
+-        TopType,
+-        BottomWispyStrength,
+-        HFStrength,
+-        HFStrengthAnvil);
++        AnvilStrength,
++        noise.HFErosionModifier,
++        noise.EffectiveHFStrength);
+ 
+     float coverageMask = saturate(Coverage) * saturate(StormStencil);
+-    return StormEvaluateDensity(normalNoise, verticalProfile, coverageMask);
++    return StormEvaluateDensity(
++        noise.NoiseComposite, verticalProfile, coverageMask);
+ }
+diff --git a/Plugins/SavageSuperStorm/Source/SavageSuperStormRuntime/Public/Field/StormDensityContract.h b/Plugins/SavageSuperStorm/Source/SavageSuperStormRuntime/Public/Field/StormDensityContract.h
+--- a/Plugins/SavageSuperStorm/Source/SavageSuperStormRuntime/Public/Field/StormDensityContract.h
++++ b/Plugins/SavageSuperStorm/Source/SavageSuperStormRuntime/Public/Field/StormDensityContract.h
+@@ -11,6 +11,9 @@
+ // from becoming large interior cavities through artist strength controls.
+ inline constexpr float HFErosionBudget = 0.20f;
++inline constexpr float StratusProfileResidual = 0.025f;
++inline constexpr float StratusProfileSolid = 0.125f;
++inline constexpr float StratusBaseErosionBudget = 0.20f;
+ 
+ struct FHeightSample
+ {
+@@ -230,6 +233,48 @@ inline float EvaluateDimensionalFromProfiles(
+         0.0f,
+         1.0f);
+ }
++
++inline float EvaluateThinStratusMask(
++    float ProfileMask,
++    float ThresholdShift)
++{
++    const float Shift = FMath::Max(ThresholdShift, 0.0f);
++    return FMath::SmoothStep(
++        StratusProfileResidual + Shift,
++        StratusProfileSolid + Shift,
++        FMath::Clamp(ProfileMask, 0.0f, 1.0f));
++}
++
++inline float EvaluateStratusNormalProfile(
++    float BottomProfile,
++    float TopProfile,
++    float TopType,
++    float HFErosionModifier,
++    float EffectiveHFStrength)
++{
++    const float Bottom = FMath::Clamp(BottomProfile, 0.0f, 1.0f);
++    const float Top = FMath::Clamp(TopProfile, 0.0f, 1.0f);
++    const float RawProfile = Bottom * Top;
++    const float StratusWeight = 1.0f - FMath::SmoothStep(
++        0.0f,
++        0.5f,
++        FMath::Clamp(TopType, 0.0f, 1.0f));
++    const float BottomThresholdShift = FMath::Clamp(
++        HFErosionModifier,
++        0.0f,
++        1.0f)
++        * FMath::Clamp(EffectiveHFStrength, 0.0f, 1.0f)
++        * StratusBaseErosionBudget
++        * StratusWeight;
++    const float ThinProfile = EvaluateThinStratusMask(
++        Bottom,
++        BottomThresholdShift)
++        * EvaluateThinStratusMask(Top, 0.0f);
++    return FMath::Clamp(
++        FMath::Lerp(RawProfile, ThinProfile, StratusWeight),
++        0.0f,
++        1.0f);
++}
+ 
+ inline FNoiseMorphology EvaluateHFMorphology(
+     float HFFbmRaw,
+diff --git a/Plugins/SavageSuperStorm/Source/SavageSuperStormRuntime/Private/Tests/StormDensityContractTests.cpp b/Plugins/SavageSuperStorm/Source/SavageSuperStormRuntime/Private/Tests/StormDensityContractTests.cpp
+--- a/Plugins/SavageSuperStorm/Source/SavageSuperStormRuntime/Private/Tests/StormDensityContractTests.cpp
++++ b/Plugins/SavageSuperStorm/Source/SavageSuperStormRuntime/Private/Tests/StormDensityContractTests.cpp
+@@ -220,6 +220,50 @@ bool FStormDensityNoiseContractTest::RunTest(const FString& Parameters)
+             EvaluateHeightAwareHFStrength(0.45f, 0.25f, 0.55f),
+             0.385f,
+             1.0e-6f));
++
++    const float AuthoredStratusBottom = FMath::SmoothStep(
++        0.10f, 0.20f, 0.14f);
++    const float AuthoredStratusTop = 1.0f - FMath::SmoothStep(
++        0.08f, 0.18f, 0.14f);
++    const float AuthoredStratusPeak = AuthoredStratusBottom
++        * AuthoredStratusTop;
++    TestTrue(TEXT("The authored Type-0 profile has only a thin overlap lobe"),
++        FMath::IsNearlyEqual(AuthoredStratusPeak, 0.123904f, 1.0e-6f));
++    TestEqual(TEXT("Thin Type-0 overlap is normalized to occupied density"),
++        EvaluateStratusNormalProfile(
++            AuthoredStratusBottom,
++            AuthoredStratusTop,
++            0.0f,
++            0.0f,
++            1.0f),
++        1.0f);
++    TestEqual(TEXT("Profile repair never fills outside a zero LUT support"),
++        EvaluateStratusNormalProfile(0.0f, 1.0f, 0.0f, 0.0f, 1.0f),
++        0.0f);
++    TestEqual(TEXT("HF moves the Type-0 lower boundary"),
++        EvaluateStratusNormalProfile(0.15f, 1.0f, 0.0f, 1.0f, 1.0f),
++        0.0f);
++    TestEqual(TEXT("Without HF the same Type-0 boundary sample is occupied"),
++        EvaluateStratusNormalProfile(0.15f, 1.0f, 0.0f, 0.0f, 1.0f),
++        1.0f);
++    TestEqual(TEXT("HF cannot excavate an established Type-0 interior"),
++        EvaluateStratusNormalProfile(1.0f, 1.0f, 0.0f, 1.0f, 1.0f),
++        1.0f);
++    TestTrue(TEXT("Type 0.5 keeps the authored full-profile path"),
++        FMath::IsNearlyEqual(
++            EvaluateStratusNormalProfile(
++                0.15f, 0.80f, 0.5f, 1.0f, 1.0f),
++            0.12f,
++            1.0e-6f));
+ 
+     const float BudgetedLowerBound = EvaluateHFErosionLowerBound(0.80f, 0.55f);
+     TestTrue(TEXT("HF detail budget scales the example lower bound to 0.088"),

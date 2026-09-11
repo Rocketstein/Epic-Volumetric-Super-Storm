@@ -1,0 +1,64 @@
+// Copyright 2026 GoroGoro. All Rights Reserved.
+
+/**
+ * @file StormFlowMapMaterialAdapter.ush
+ * @brief Exposes flow-map evaluation to material Custom nodes.
+ */
+
+#pragma once
+
+#include "/VolumetricSuperStormShaders/Public/StormFlowMapContract.ush"
+
+float3 StormSanitizeFlowMapLayerHeights(float3 LayerHeights)
+{
+	float lowerHeight  = clamp(LayerHeights.x, 0.0, 0.9998);
+	float middleHeight = clamp(LayerHeights.y, lowerHeight + 1.0e-4, 0.9999);
+	float upperHeight  = clamp(LayerHeights.z, middleHeight + 1.0e-4, 1.0);
+	return float3(lowerHeight, middleHeight, upperHeight);
+}
+
+float3 StormEvaluateFlowMapLayerWeights(float HLocal, float3 LayerHeights)
+{
+	float3 heights = StormSanitizeFlowMapLayerHeights(LayerHeights);
+	float  h       = saturate(HLocal);
+
+	float lowerToMiddle = smoothstep(0.0, 1.0, saturate((h - heights.x) / max(heights.y - heights.x, 1.0e-4)));
+	float middleToUpper = smoothstep(0.0, 1.0, saturate((h - heights.y) / max(heights.z - heights.y, 1.0e-4)));
+
+	return h <= heights.y ? float3(1.0 - lowerToMiddle, lowerToMiddle, 0.0) : float3(0.0, 1.0 - middleToUpper, middleToUpper);
+}
+
+float3 StormEvaluateFlowMapUVWVelocity(Texture2D LowerFlowMap, SamplerState LowerFlowSampler, Texture2D MiddleFlowMap, SamplerState MiddleFlowSampler, Texture2D UpperFlowMap, SamplerState UpperFlowSampler, float2 FlowUV, float HLocal, float3 LayerHeights, float3 UVWStrength, float FlowMapEnabled)
+{
+	float2 uv = saturate(FlowUV);
+
+	float3 lowerVelocity  = StormDecodeFlowMapVelocity(Texture2DSampleLevel(LowerFlowMap, LowerFlowSampler, uv, 0));
+	float3 middleVelocity = StormDecodeFlowMapVelocity(Texture2DSampleLevel(MiddleFlowMap, MiddleFlowSampler, uv, 0));
+	float3 upperVelocity  = StormDecodeFlowMapVelocity(Texture2DSampleLevel(UpperFlowMap, UpperFlowSampler, uv, 0));
+
+	float3 layerWeights    = StormEvaluateFlowMapLayerWeights(HLocal, LayerHeights);
+	float3 blendedVelocity = lowerVelocity * layerWeights.x + middleVelocity * layerWeights.y + upperVelocity * layerWeights.z;
+	return blendedVelocity * UVWStrength * saturate(FlowMapEnabled);
+}
+
+struct FStormFlowMapUVWPhases
+{
+	float3 OffsetA;
+	float3 OffsetB;
+	float  WeightA;
+};
+
+FStormFlowMapUVWPhases StormEvaluateFlowMapUVWPhases(Texture2D LowerFlowMap, SamplerState LowerFlowSampler, Texture2D MiddleFlowMap, SamplerState MiddleFlowSampler, Texture2D UpperFlowMap, SamplerState UpperFlowSampler, float2 FlowUV, float HLocal, float3 LayerHeights, float3 UVWStrength, float FlowMapEnabled, float FlowTimeSeconds, float FlowCycleSeconds)
+{
+	float3 maximumOffset = StormEvaluateFlowMapUVWVelocity(LowerFlowMap, LowerFlowSampler, MiddleFlowMap, MiddleFlowSampler, UpperFlowMap, UpperFlowSampler, FlowUV, HLocal, LayerHeights, UVWStrength, FlowMapEnabled);
+
+	float safeCycleSeconds = FlowCycleSeconds >= 0.1 ? FlowCycleSeconds : 12.0;
+	float phaseA           = frac(FlowTimeSeconds / safeCycleSeconds);
+	float phaseB           = frac(phaseA + 0.5);
+
+	FStormFlowMapUVWPhases result;
+	result.OffsetA = maximumOffset * phaseA;
+	result.OffsetB = maximumOffset * phaseB;
+	result.WeightA = 1.0 - abs(phaseA * 2.0 - 1.0);
+	return result;
+}

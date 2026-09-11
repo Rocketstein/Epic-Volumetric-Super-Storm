@@ -1,36 +1,57 @@
-# Unreal generated / build output — matches these dir names at any depth
+# Unreal generated directories
 Binaries/
 Build/
 DerivedDataCache/
 Intermediate/
 Saved/
-
-# IDE / editor caches
 .vs/
 .vscode/
 .idea/
-*.VC.db
-*.VC.opendb
+
+# Generated project/IDE files
+*.sln
+*.slnx
 *.suo
 *.sdf
 *.opensdf
-
-# Generated solution / project files
-*.sln
-*.slnx
+*.VC.db
+*.VC.opendb
 *.xcodeproj
 *.xcworkspace
 *.DotSettings.user
 
-# OS cruft
+# Python caches and virtual environments
+.venv/
+__pycache__/
+*.py[cod]
+
+# OS files
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# Claude Code local metadata (already p4-ignored)
-.claude/
+# The public host project intentionally ships without project Content.
+/Content/
+*.umap
+**/__ExternalActors__/
+**/__ExternalObjects__/
+*_HLOD*_Instancing.uasset
+*.wav
+*.wave
+*.mp3
+*.ogg
+*.flac
+*.aif
+*.aiff
 
-# Binary content — source-only checkpoint. Perforce owns binaries.
-# Delete this line (and set up Git LFS) if you want git to version Content too.
-Content/
-/Docs/StormFlowMapLayerWeightPlan.md
+# Keep only the approved listing document.
+/Docs/*
+!/Docs/Release/
+/Docs/Release/*
+!/Docs/Release/FabListing.md
+/Plugins/*/Docs/
+/Plugins/*/README.md
+/Plugins/*/CHANGELOG.md
+/Plugins/*/CREDITS.md
+
+# .codex_tmp is intentionally tracked in this public snapshot.

@@ -1,0 +1,399 @@
+﻿#pragma once
+#include "/Engine/Public/Platform.ush"
+#include "/SavageSuperStormShaders/Public/StormShapeField.ush"
+#include "/SavageSuperStormShaders/Public/StormCoordinates.ush"
+#include "/SavageSuperStormShaders/Public/StormSpiralContract.ush"
+
+// =====================================================================
+// FINAL SHAPE ABI
+// =====================================================================
+// Shape compute owns the one-and-only Coverage/TopType NDF composite.
+// ShapeRT2.G is the continuous storm-local source field used by that
+// composite; material density must not apply it a second time.
+//
+// RT1: R = FinalCloudCoverage | G = BaseBottomType | B = FinalTopType
+//      | A = packed StormStencil
+// RT2: R = MinLayerHeight01 | G = TwistedModelingNoise
+//      | B = MaxLayerHeight01 | A = CenterMask
+// =====================================================================
+
+uint Resolution;
+float2 StormExtent;
+float StormRadius;
+
+float EnvelopeRadius;
+float EnvelopeFalloff;
+float OuterBrimRadiusScale;
+float CoverageCeiling;
+float CoverageRimValue;
+float CoverageRimStart01;
+float InnerMinLayerHeight01;
+float OuterMinLayerHeight01;
+float InnerMaxLayerHeight01;
+float OuterMaxLayerHeight01;
+
+// Shared spiral profile (same values bound to the material).
+float ShapeTwistRadians;
+float SpiralTwistPower;
+float SpiralFullStrengthRadius01;
+float SpiralZeroStrengthRadius01;
+
+// Serialized legacy names retained for the v10 continuous modeling field.
+// All former threshold/depth/speck/rim controls are absent from the active
+// shader path.
+float SpiralCarveIslandScale;
+float SpiralCarveDetailScaleMul;
+float SpiralCarveDetailAmount;
+float SpiralSeed;
+
+float RotationSign;
+
+RWTexture2D<float4> OutShapeTexture;
+RWTexture2D<float4> OutShapeTexture2;
+
+// ---------------------------------------------------------------------
+// Raw storm-local NDF source field, 0..1. The twist is an inverse mapping
+// of a static smooth noise domain. Mature containment is applied only when
+// writing ShapeRT2.G, never before Coverage/TopType composition.
+// ---------------------------------------------------------------------
+float2 StormEvaluateTwistedModelingSourceCoord(
+    float2 BodyCoord,
+    float OuterBrimRadiusScale,
+    float RotationSignValue,
+    float TwistRadians,
+    float FullStrengthRadius01,
+    float ZeroStrengthRadius01,
+    float TwistPower)
+{
+    float outerBrimRadius = max(
+        abs(OuterBrimRadiusScale),
+        1.0e-4);
+    float2 normalizedBody = BodyCoord / outerBrimRadius;
+
+    float r = max(length(normalizedBody), 1.0e-4);
+    float theta = atan2(normalizedBody.y, normalizedBody.x);
+
+    float rFull = max(
+        min(
+            FullStrengthRadius01,
+            ZeroStrengthRadius01 - 1.0e-4),
+        1.0e-3);
+    float rZero = max(
+        ZeroStrengthRadius01,
+        rFull + 1.0e-4);
+    float rClamped = clamp(r, rFull, rZero);
+    float logDenom = max(
+        log(rZero) - log(rFull),
+        1.0e-4);
+
+    // A log-radius inverse map keeps useful radial angular shear throughout
+    // the active annulus, stretching sparse islands into spiral arcs.
+    float u = saturate(
+        (log(rZero) - log(rClamped))
+        / logDenom);
+    float twistWeight = pow(
+        u,
+        max(TwistPower, 1.0e-4));
+    float handedness = RotationSignValue < 0.0 ? -1.0 : 1.0;
+    float thetaSource = theta
+        - handedness * TwistRadians * twistWeight;
+
+    return float2(
+        cos(thetaSource),
+        sin(thetaSource)) * r;
+}
+
+float StormEvaluateTwistedModelingNoise(
+    float2 BodyCoord,
+    float OuterBrimRadius)
+{
+    float2 sourceP = StormEvaluateTwistedModelingSourceCoord(
+        BodyCoord,
+        OuterBrimRadius,
+        RotationSign,
+        ShapeTwistRadians,
+        SpiralFullStrengthRadius01,
+        SpiralZeroStrengthRadius01,
+        SpiralTwistPower);
+    float2 sourceUV = sourceP * 0.5 + 0.5;
+
+    float baseScale = max(abs(SpiralCarveIslandScale), 1.0e-3);
+    float detailScale = baseScale
+        * max(abs(SpiralCarveDetailScaleMul), 1.0);
+    float macroNoise = SampleStormNoise(
+        sourceUV,
+        baseScale,
+        SpiralSeed);
+    float detailNoise = SampleStormNoise(
+        sourceUV + float2(0.173, -0.291),
+        detailScale,
+        SpiralSeed + 551.3);
+
+    return saturate(lerp(
+        macroNoise,
+        detailNoise,
+        saturate(SpiralCarveDetailAmount)));
+}
+
+struct FStormShapeSample
+{
+    float Coverage;
+    float BottomType;
+    float TopType;
+    float StormStencil;
+    float MinLayerHeight01;
+    float TwistedModelingNoise;
+    float MaxLayerHeight01;
+    float CenterMask;
+};
+
+FStormShapeSample StormEvaluateMatureShape(float2 BodyCoord)
+{
+    FStormShapeSample result;
+
+    float2 canonicalShapeUV = StormBodyCoordToCanonicalShapeUV(BodyCoord);
+    float outerBrimRadius = max(abs(OuterBrimRadiusScale), 1.0e-4);
+    float2 p = BodyCoord / outerBrimRadius;
+    float radiusAcrossOuterBrim01 = saturate(length(p));
+    float inward01 = 1.0 - radiusAcrossOuterBrim01;
+    float r01 = length(BodyCoord);
+
+    float2 bodyDirection = r01 > 1.0e-5
+        ? BodyCoord / r01
+        : float2(0.70710678, 0.70710678);
+    float2 directionUV = bodyDirection * 0.5 + 0.5;
+
+    float boundaryMacro = SampleStormNoise(
+        canonicalShapeUV + float2(0.137, -0.223),
+        1.43,
+        71.9);
+    float boundaryMeso = SampleStormNoise(
+        canonicalShapeUV.yx * float2(-1.07, 0.93) + float2(-0.191, 0.274),
+        3.27,
+        129.4);
+    float boundaryFine = SampleStormNoise(
+        canonicalShapeUV + float2(boundaryMeso - 0.5, boundaryMacro - 0.5) * 0.11,
+        6.15,
+        188.6);
+
+    float boundaryAngularA = SampleStormNoise(
+        directionUV + float2(0.211, -0.147),
+        1.67,
+        37.6);
+    float boundaryAngularB = SampleStormNoise(
+        directionUV.yx * float2(-1.13, 0.91) + float2(-0.193, 0.271),
+        3.41,
+        94.2);
+    float angularLobeA = smoothstep(0.11, 0.50, boundaryAngularA);
+    float angularLobeB = smoothstep(0.10, 0.48, boundaryAngularB);
+    float boundaryRadiusScale = max(
+        0.58,
+        0.76
+            + angularLobeA * 0.38
+            + angularLobeB * 0.17
+            + bodyDirection.x * 0.07
+            - bodyDirection.y * 0.045
+            + bodyDirection.x * bodyDirection.y * 0.05);
+
+    float2 boundaryWarp = float2(
+        boundaryMacro - boundaryMeso,
+        boundaryFine - boundaryMacro) * 0.25;
+    float2 irregularBody = BodyCoord + boundaryWarp;
+    float2 irregularMetricCoord = float2(
+        irregularBody.x * 0.90 + irregularBody.y * 0.16,
+        irregularBody.y * 1.07 - irregularBody.x * 0.11);
+    float matureMetric = max(
+        length(irregularMetricCoord) / boundaryRadiusScale
+            + (boundaryMacro - 0.32) * 0.09
+            + (boundaryFine - 0.32) * 0.045,
+        0.0);
+    float matureRadius01 = saturate(matureMetric / outerBrimRadius);
+    float radial01 = saturate(1.0 - matureRadius01);
+
+    float envelopeFeather01 = saturate(
+        EnvelopeFalloff / max(EnvelopeRadius, 1.0e-4))
+        * outerBrimRadius;
+    float matureEdgeFeather = max(envelopeFeather01, outerBrimRadius * 0.14);
+    float matureStencil = 1.0 - smoothstep(
+        outerBrimRadius - matureEdgeFeather,
+        outerBrimRadius + matureEdgeFeather * 0.20,
+        matureMetric);
+
+    float feederBoundaryMacro = saturate(
+        boundaryMacro * 0.57 + boundaryMeso * 0.29 + boundaryFine * 0.14);
+    float feederBoundaryDetail = saturate(
+        boundaryFine * 0.55 + boundaryMeso * 0.30 + boundaryMacro * 0.15);
+    float feederWarpRamp = smoothstep(
+        outerBrimRadius + 0.035,
+        outerBrimRadius + 0.30,
+        matureMetric);
+    float feederMetric = matureMetric
+        + ((feederBoundaryMacro - 0.5) * 0.13
+            + (feederBoundaryDetail - 0.5) * 0.055)
+        * feederWarpRamp;
+
+    float2 fieldHalfExtentBody = abs(StormExtent)
+        / max(abs(StormRadius), 1.0e-4);
+    float nearestFieldEdge = min(
+        fieldHalfExtentBody.x - abs(BodyCoord.x),
+        fieldHalfExtentBody.y - abs(BodyCoord.y));
+    float fieldEdgeGuard = smoothstep(0.055, 0.24, nearestFieldEdge);
+    float safeSupportLimit = max(
+        outerBrimRadius + 0.30,
+        min(fieldHalfExtentBody.x, fieldHalfExtentBody.y) - 0.14);
+
+    float feederSupportRadius = min(
+        outerBrimRadius
+            + 0.58
+            + (feederBoundaryMacro - 0.5) * 0.16,
+        safeSupportLimit);
+    float feederDistanceSupport = 1.0 - smoothstep(
+        outerBrimRadius + 0.015,
+        max(feederSupportRadius, outerBrimRadius + 0.34),
+        feederMetric);
+
+    float feederCoordinate = pow(
+        saturate(feederDistanceSupport * fieldEdgeGuard),
+        0.72);
+
+    float2 activeWarpedBody = BodyCoord
+        + float2(
+            feederBoundaryMacro - feederBoundaryDetail,
+            boundaryMeso - boundaryMacro) * 0.29;
+    const float2 activeDirectionA = float2(0.842, -0.540);
+    const float2 activeDirectionB = float2(-0.218, 0.976);
+    const float2 activeDirectionC = float2(-0.947, -0.322);
+    const float2 activeCrossA = float2(0.540, 0.842);
+    const float2 activeCrossB = float2(-0.976, -0.218);
+    const float2 activeCrossC = float2(0.322, -0.947);
+    float activeAlongA = dot(activeWarpedBody, activeDirectionA);
+    float activeAlongB = dot(activeWarpedBody, activeDirectionB);
+    float activeAlongC = dot(activeWarpedBody, activeDirectionC);
+    float activeAcrossA = dot(activeWarpedBody, activeCrossA)
+        + (feederBoundaryMacro - 0.5) * 0.42;
+    float activeAcrossB = dot(activeWarpedBody, activeCrossB)
+        + (feederBoundaryDetail - 0.5) * 0.39;
+    float activeAcrossC = dot(activeWarpedBody, activeCrossC)
+        + (boundaryMeso - 0.5) * 0.36;
+    float activeLaneA = smoothstep(-0.52, -0.03, activeAlongA)
+        * (1.0 - smoothstep(1.68, 1.94, activeAlongA))
+        * (1.0 - smoothstep(0.73, 1.20, abs(activeAcrossA)));
+    float activeLaneB = smoothstep(-0.47, 0.00, activeAlongB)
+        * (1.0 - smoothstep(1.61, 1.88, activeAlongB))
+        * (1.0 - smoothstep(0.68, 1.12, abs(activeAcrossB)));
+    float activeLaneC = smoothstep(-0.42, 0.04, activeAlongC)
+        * (1.0 - smoothstep(1.54, 1.81, activeAlongC))
+        * (1.0 - smoothstep(0.70, 1.15, abs(activeAcrossC)));
+    float activeNearMature = 1.0 - smoothstep(
+        outerBrimRadius + 0.12,
+        outerBrimRadius + 0.31,
+        feederMetric);
+    float activePattern = saturate(max(
+        activeNearMature,
+        max(activeLaneA, max(activeLaneB * 0.92, activeLaneC * 0.82))));
+    float feederActive = activePattern > 0.018 ? 1.0 : 0.0;
+
+    float packedFeeder = feederActive > 0.5
+        ? 0.55 + feederCoordinate * 0.45
+        : feederCoordinate * 0.45;
+    result.StormStencil = matureStencil > 1.0e-5
+        ? 1.0 + matureStencil
+        : saturate(packedFeeder);
+
+    result.CenterMask = pow(saturate(inward01), 1.65);
+    float noiseSeed = 17.0;
+
+    // Evaluate the raw field once. Coverage and TopType use this raw value;
+    // matureStencil is reserved for the ShapeRT2.G ABI/debug write below.
+    float rawTwistedModelingNoise = StormEvaluateTwistedModelingNoise(
+        BodyCoord,
+        outerBrimRadius);
+
+    float coverageCeiling = saturate(CoverageCeiling);
+    float coverageMinimum = min(
+        saturate(CoverageRimValue),
+        coverageCeiling);
+    float rimFall = smoothstep(
+        saturate(CoverageRimStart01),
+        1.0,
+        radiusAcrossOuterBrim01);
+    float radialCoverage = lerp(
+        coverageCeiling,
+        coverageMinimum,
+        rimFall);
+    float noisyCoverage = lerp(
+        coverageMinimum,
+        radialCoverage,
+        rawTwistedModelingNoise);
+    result.Coverage = saturate(lerp(
+        noisyCoverage,
+        coverageCeiling,
+        result.CenterMask));
+
+    // BaseBottomType stays independent of the G-channel source field.
+    result.BottomType = inward01;
+
+    float radialTopType = saturate(inward01);
+    float noisyTopType = saturate(
+        radialTopType * rawTwistedModelingNoise);
+    result.TopType = saturate(lerp(
+        noisyTopType,
+        1.0,
+        result.CenterMask));
+
+    result.TwistedModelingNoise = saturate(
+        rawTwistedModelingNoise * matureStencil);
+
+    // RT2.R/B are independent local-height fields across the mature radius:
+    // Inner at the center, Outer at the Coverage rim.
+    result.MinLayerHeight01 = lerp(
+        saturate(InnerMinLayerHeight01),
+        saturate(OuterMinLayerHeight01),
+        radiusAcrossOuterBrim01);
+    result.MaxLayerHeight01 = lerp(
+        saturate(InnerMaxLayerHeight01),
+        saturate(OuterMaxLayerHeight01),
+        radiusAcrossOuterBrim01);
+    if (matureStencil <= 1.0e-5)
+    {
+        // Feeder-only columns remain shallow; the packed stencil carries
+        // the active/support state while RT2.G stays disabled outside mature shape.
+        float feederMacro = SampleStormNoise(
+            canonicalShapeUV + float2(0.173, -0.291),
+            3.7,
+            noiseSeed + 143.2);
+        result.Coverage = 0.0;
+        result.MinLayerHeight01 = lerp(0.055, 0.105, feederMacro);
+        result.MaxLayerHeight01 = lerp(0.28, 0.44, feederMacro);
+        result.TwistedModelingNoise = 0.0;
+        result.CenterMask = 0.0;
+    }
+
+    return result;
+}
+
+[numthreads(NUM_THREADS_X, NUM_THREADS_Y, 1)]
+void BuildStormShapeRT(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+    if (DispatchThreadID.x >= Resolution || DispatchThreadID.y >= Resolution)
+    {
+        return;
+    }
+
+    uint2 id = DispatchThreadID.xy;
+    float2 uv = (float2(id) + 0.5) / float(Resolution);
+    float2 stormPosWorld = StormFieldUVToLocalCm(uv, StormExtent);
+    float2 bodyCoord = StormLocalCmToBodyCoord(stormPosWorld, StormRadius);
+    FStormShapeSample shape = StormEvaluateMatureShape(bodyCoord);
+
+    OutShapeTexture[id] = float4(
+        shape.Coverage,
+        shape.BottomType,
+        shape.TopType,
+        shape.StormStencil);
+    OutShapeTexture2[id] = float4(
+        shape.MinLayerHeight01,
+        shape.TwistedModelingNoise,
+        shape.MaxLayerHeight01,
+        shape.CenterMask);
+}

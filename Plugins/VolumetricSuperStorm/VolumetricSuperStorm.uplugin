@@ -1,0 +1,43 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0.0",
+	"FriendlyName": "Volumetric Super Storm",
+	"Description": "An art-directable volumetric supercell rendered through Unreal's native Volumetric Cloud component, with in-editor painters for storm shape, wind flow, and vertical structure.",
+	"Category": "Rendering",
+	"CreatedBy": "Team GoroGoro",
+	"CreatedByURL": "https://teamgorogoro.github.io/",
+	"DocsURL": "https://teamgorogoro.github.io/",
+	"MarketplaceURL": "",
+	"SupportURL": "https://teamgorogoro.github.io/",
+	"CanContainContent": true,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "VolumetricSuperStormRuntime",
+			"Type": "Runtime",
+			"LoadingPhase": "Default",
+			"PlatformAllowList": [ "Win64" ]
+		},
+		{
+			"Name": "VolumetricSuperStormShaders",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit",
+			"PlatformAllowList": [ "Win64" ]
+		},
+		{
+			"Name": "VolumetricSuperStormEditor",
+			"Type": "Editor",
+			"LoadingPhase": "PostEngineInit",
+			"PlatformAllowList": [ "Win64" ]
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "Niagara",
+			"Enabled": true
+		}
+	]
+}

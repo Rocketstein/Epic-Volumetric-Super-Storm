@@ -1,18 +1,16 @@
-# Fab listing copy — Savage Super Storm 1.0.0
+# Fab listing — Volumetric Super Storm 1.0.0
 
-Internal document. This is the source text for the Fab product page; it does not
-ship inside the plugin. Paste each block into the matching field in the Fab
-publisher portal.
+Source text for the Fab product page. Paste each block into the matching field
+in the publisher portal. Nothing here ships inside the plugin.
 
-Field limits and preview-media dimensions change; check the current values in the
-publisher portal before pasting, and trim rather than let the form truncate.
+Every field the portal exposes is filled below. Leave none of them blank.
 
 ---
 
 ## Product name
 
 ```
-Savage Super Storm
+Volumetric Super Storm
 ```
 
 ## Seller
@@ -30,10 +28,10 @@ An art-directable volumetric supercell for Unreal Engine 5.8. Renders through th
 ## Long description
 
 ```
-Savage Super Storm renders a single large, art-directable storm — mesocyclone body, anvil, spiral banding, underside detail — through Unreal Engine's native Volumetric Cloud component. It is a complete authoring system, not a material you wire up yourself: drop the actor in, point it at your cloud, and shape the storm with dedicated editor tools.
+Volumetric Super Storm renders a single large, art-directable storm — mesocyclone body, anvil, spiral banding, underside detail — through Unreal Engine's native Volumetric Cloud component. It is a complete authoring system, not a material you wire up yourself: drop the actor in, point it at your cloud, and shape the storm with dedicated editor tools.
 
 ONE ACTOR DRIVES EVERYTHING
-Volumetric Super Storm Actor owns the storm's shape, motion, lightning, and formation state, and binds the cloud material for you. It stores the cloud's previous material and restores it when the storm is removed, so dropping a storm into an existing sky is non-destructive.
+The storm actor owns the storm's shape, motion, lightning, and formation state, and binds the cloud material for you. It stores the cloud's previous material and restores it when the storm is removed, so dropping a storm into an existing sky is non-destructive. Drag the native storm actor into the level and it works. A BP_VolumetricSuperStorm Blueprint subclass is also included as a reference for the Blueprint event API, if you want one — place the actor or the Blueprint, not both.
 
 PAINT THE STORM, DON'T GUESS AT IT
 Two dedicated editor tools replace numeric guesswork.
@@ -46,7 +44,7 @@ MOTION WITH STRUCTURE
 Up to six concentric rotation rings, each with its own angular speed and phase skew, blended across authorable boundaries. Radial and vertical masks limit where motion applies, and low-frequency, high-frequency, and curl fields rotate at independent multipliers so the storm shears rather than spinning as a rigid disc.
 
 AUTHORED LIGHTNING
-Cue sequences drive material pulses and resolve ground-strike locations, with repeat delay and strike probability. Start, cue, strike, pulse, and finish all fire as Blueprint events, so you can hang thunder, camera shake, and gameplay off the storm's own timing. Ships with a Niagara lightning system, lightning material, and thunder audio.
+Cue sequences drive material pulses and resolve ground-strike locations, with repeat delay and strike probability. Start, cue, strike, pulse, and finish all fire as Blueprint events, so you can hang bolt VFX, thunder, camera shake, and gameplay off the storm's own timing. What ships is the timing, not the presentation: no bolt VFX and no audio are bundled. BP_VolumetricSuperStorm carries worked examples of the handlers so you can see exactly where your own effects attach.
 
 FORMATION AND DISSOLUTION
 Timed create and dissolve animations with completion events, plus immediate show and hide for cutting between shots.
@@ -58,20 +56,20 @@ EDITOR-TIME PREVIEW
 The storm renders and animates in the editor viewport. You are not iterating through PIE.
 
 DOCUMENTED
-A full documentation site covers installation, a first-storm walkthrough, four authoring guides, complete actor and Blueprint reference, limitations, and troubleshooting.
+A full documentation site covers requirements, installation, a first-storm walkthrough, four authoring guides, complete actor and Blueprint reference, limitations, and troubleshooting.
 
 BEFORE YOU BUY
-This plugin renders one storm per world by design — the world subsystem accepts a single registered storm actor rather than sharing shape render targets. Vertical placement is owned by your Volumetric Cloud layer, not by the storm actor's transform. Both behaviours are documented in detail; please read the Limitations page linked below if either is a constraint for your project.
+This plugin requires Windows 64-bit with DirectX 12 and Shader Model 6; DirectX 11 and SM5 are not supported. It renders one storm per world by design — the world subsystem accepts a single registered storm actor rather than sharing shape render targets. Vertical placement is owned by your Volumetric Cloud layer, not by the storm actor's transform. Lightning ships as timing and events, not as presentation: the cue sequence, ground-strike resolution, and cloud material pulse are all here, but no bolt VFX and no audio are bundled. All four behaviours are documented in detail; please read the Requirements and Limitations pages linked below if any of them is a constraint for your project.
 ```
 
-## Technical details
+## Technical Details
 
-Paste into the **Technical Details** field. Every number below was counted from
-the 1.0.0 source tree — recount if the tree changes before submission.
+Paste into the **Technical Details** field.
 
 ```
 Features:
  • One-actor storm system driving Unreal's native Volumetric Cloud component
+ • Ready-to-place BP_VolumetricSuperStorm Blueprint, or the native C++ actor for custom subclassing
  • Vertical profile painter — bottom, top, and anvil silhouette authoring with composite preview, undo, and runtime blending between saved profiles
  • Three-layer wind flow-map editor with drag-direction and encoded-RGBA brushes, 32–2048 authoring resolution, and a layer-authority ribbon
  • Six-ring motion system with per-ring speed and skew, radial and vertical masks, and independent LF/HF/curl rotation
@@ -81,42 +79,42 @@ Features:
  • Editor viewport preview without entering PIE
 
 Code Modules:
- • SavageSuperStormRuntime (Runtime)
- • SavageSuperStormShaders (Runtime)
- • SavageSuperStormEditor (Editor)
+ • VolumetricSuperStormRuntime (Runtime)
+ • VolumetricSuperStormShaders (Runtime)
+ • VolumetricSuperStormEditor (Editor)
 
-Number of Blueprints: 4
-Number of C++ Classes: 12
+Number of Blueprints: 1
+Number of C++ Classes: 16
 Network Replicated: No
 Supported Development Platforms: Windows
 Supported Target Build Platforms: Windows
-Documentation: https://team-gorogoro.github.io/VolumetricSuperstorm_Docs/
-Important/Additional Notes: Requires the Niagara plugin, which ships with Unreal Engine and is enabled by default. Requires a Volumetric Cloud component, Sky Atmosphere, and Directional Light in the level. Renders one storm per world by design. Storm heights are normalized to the Volumetric Cloud layer, so absolute altitude and thickness stay properties of that component.
+Documentation: https://teamgorogoro.github.io/
+Example Project: None — the plugin ships four storm presets, two wind flow maps, and nine vertical profiles that can be applied to any level, plus M_StormMinimalSetup for levels without an existing cloud material.
+Important/Additional Notes: Requires Windows 64-bit with DirectX 12 and Shader Model 6. DirectX 11 and Shader Model 5 are not supported. Requires the Niagara plugin, which ships with Unreal Engine and is enabled by default. Requires a Volumetric Cloud component, Sky Atmosphere, and Directional Light in the level. Place either BP_VolumetricSuperStorm or the native storm actor — one storm actor per world; a second is rejected by the world subsystem. Storm heights are normalized to the Volumetric Cloud layer, so absolute altitude and thickness stay properties of that component. No bolt VFX and no audio assets are bundled; the lightning system exposes Blueprint events for driving your own bolts and thunder, and BP_VolumetricSuperStorm carries worked examples of the handlers.
 ```
 
-### Where the numbers come from
+### Counts, and what they were taken from
 
-| Field | Value | Counted from |
+Counted against the working tree on 2026-08-06, after removing the five audio
+assets, both `BP_StormLightningController` variants, the three
+`CF_StormLightning*` curves, and the three presets and profiles named after a
+team member, and after CL238 added `M_StormMinimalSetup` and
+`VP_DocsProfileExample`.
+
+| Field | Value | Source |
 |---|---:|---|
-| C++ classes | 12 | `UCLASS` declarations across `Source/**/*.h` |
-| Blueprints | 4 | `BP_VolumetricSuperStorm`, `BP_StormLightningController` ×3 versions |
-| Structs / enums | 18 / 8 | `USTRUCT` / `UENUM` |
+| C++ classes | 16 | `UCLASS` declarations across `Source/**/*.h` |
+| Blueprints | 1 | `BP_VolumetricSuperStorm` |
+| Structs / enums | 23 / 10 | `USTRUCT` / `UENUM` |
 | `UFUNCTION` declarations | 84 | `Source/**/*.h` |
 | Blueprint nodes | 72 | 44 `BlueprintCallable` + 28 `BlueprintPure` |
 | Blueprint events | 7 | `BlueprintAssignable` |
-| Content assets | 50 | `.uasset` files under `Content/` |
+| Content assets | 41 | `.uasset` files under `Content/` |
 | Shaders | 3 `.usf`, 11 `.ush` | `Shaders/` |
 
-> **Blueprint count is provisional.** `BP_StormLightningController`,
-> `_V2`, and `_V4` are three versions of one controller. Ship one, and the count
-> becomes 2. Resolve this before pasting — see `비상!!!!!!!!.md` at the project
-> root.
-
-> **Platform claim is deliberately narrow.** Windows is the only platform the
-> plugin has been built and run on. Nothing in the three `Build.cs` files
-> restricts platforms, so Mac, Linux, and console are *plausible* — but do not
-> list a platform you have not launched a packaged build on. Adding platforms
-> later is a listing edit; a refund wave over an untested claim is not.
+Platforms list Windows only because Windows is the only platform a packaged
+build has been launched on. Nothing in the three `Build.cs` files restricts
+platforms, so adding a platform later is a listing edit once it has been tested.
 
 ## Supported engine versions
 
@@ -130,6 +128,27 @@ Important/Additional Notes: Requires the Niagara plugin, which ships with Unreal
 volumetric, clouds, storm, weather, supercell, hurricane, tornado, sky, lightning, vfx, environment, atmosphere
 ```
 
+## Support contact
+
+```
+gorogoro9012@gmail.com
+```
+
+```
+https://teamgorogoro.github.io/
+```
+
+The same address is set in `VolumetricSuperStorm.uplugin` (`SupportURL`) and in the
+plugin `README.md`. All three must agree.
+
+## Generative AI disclosure
+
+```
+No
+```
+
+No generative-AI content ships in the plugin.
+
 ## Preview media
 
 Confirm current dimension and count requirements in the publisher portal, then
@@ -139,20 +158,11 @@ produce:
 |---|---|---|
 | Featured image | Listing hero | Mature storm, dramatic lighting, no UI |
 | Gallery — 5 to 8 images | Feature proof | At minimum: full storm exterior, underside, anvil detail, the flow-map editor, the vertical profile painter, the actor Details panel |
-| Video | Motion proof | Storm rotation, a formation animation, a lightning sequence, and one editor-authoring pass. Motion is the whole point of this product; a still gallery undersells it. |
+| Video | Motion proof | Storm rotation, a formation animation, a lightning sequence, and one editor-authoring pass. Motion is the whole point of this product; a still gallery undersells it. **The lightning shot must show the cloud material pulse, not a bolt** — no bolt VFX ships, and a captured bolt would misrepresent the product. |
 | Thumbnail | Grid listing | Readable at small size — silhouette, not detail |
 
-Existing captures reusable from the docs site (`Docs/docs/assets/`):
+Captures already available in the docs tree
+(`Plugins/VolumetricSuperStorm/Docs/assets/`):
 `flow-map-editor-widget.png`, `profile-editor.png`, `profile-paint.png`,
 `flow-map-working-example.mp4`, `flow-upward.mp4`,
 `profile-transition-viewport.mp4`.
-
-## Support contact
-
-```
-VERIFY — no support address is set anywhere in the project yet.
-```
-
-Fab requires a reachable support contact, and `SavageSuperStorm.uplugin` has an
-empty `SupportURL`. Decide the address, then set it in three places: this
-listing, the `.uplugin`, and `README.md`.

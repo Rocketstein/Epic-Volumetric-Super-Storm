@@ -1,0 +1,124 @@
+diff --git a/Plugins/SavageSuperStorm/Shaders/Public/StormDensityField.ush b/Plugins/SavageSuperStorm/Shaders/Public/StormDensityField.ush
+--- a/Plugins/SavageSuperStorm/Shaders/Public/StormDensityField.ush
++++ b/Plugins/SavageSuperStorm/Shaders/Public/StormDensityField.ush
+@@ -105,12 +105,12 @@ float StormEvaluateHeightAwareHFStrength(
+     float HFStrength,
+     float HFStrengthAnvil)
+ {
+-    // HFStrengthAnvil is a separate upper-column artist endpoint. It scales
+-    // the full Nubis threshold and is not a replacement morphology budget.
+-    // Setting both strength endpoints to zero disables HF erosion everywhere.
+-    float baseStrength = saturate(HFStrength);
+-    float upperStrength = max(baseStrength, saturate(HFStrengthAnvil));
+-    return lerp(baseStrength, upperStrength, saturate(HLocal));
++    // HFStrength is the global master. HFStrengthAnvil is a relative boost
++    // toward the upper column, so a zero master disables HF at every height.
++    float masterStrength = saturate(HFStrength);
++    float upperBoost = saturate(HFStrengthAnvil);
++    return saturate(
++        masterStrength * (1.0 + upperBoost * saturate(HLocal)));
+ }
+ 
+ float StormEvaluateHFErosionThreshold(
+diff --git a/Plugins/SavageSuperStorm/Source/SavageSuperStormRuntime/Public/Field/StormDensityContract.h b/Plugins/SavageSuperStorm/Source/SavageSuperStormRuntime/Public/Field/StormDensityContract.h
+--- a/Plugins/SavageSuperStorm/Source/SavageSuperStormRuntime/Public/Field/StormDensityContract.h
++++ b/Plugins/SavageSuperStorm/Source/SavageSuperStormRuntime/Public/Field/StormDensityContract.h
+@@ -283,17 +283,16 @@ inline float EvaluateHeightAwareHFStrength(
+     float HFStrength,
+     float HFStrengthAnvil)
+ {
+-    // HFStrengthAnvil is a separate upper-column artist endpoint. It scales
+-    // the full Nubis threshold and is not a replacement morphology budget.
+-    // Setting both strength endpoints to zero disables HF erosion everywhere.
+-    const float BaseStrength = FMath::Clamp(HFStrength, 0.0f, 1.0f);
+-    const float UpperStrength = FMath::Max(
+-        BaseStrength,
+-        FMath::Clamp(HFStrengthAnvil, 0.0f, 1.0f));
+-    return FMath::Lerp(
+-        BaseStrength,
+-        UpperStrength,
+-        FMath::Clamp(HLocal, 0.0f, 1.0f));
++    // HFStrength is the global master. HFStrengthAnvil is a relative boost
++    // toward the upper column, so a zero master disables HF at every height.
++    const float MasterStrength = FMath::Clamp(HFStrength, 0.0f, 1.0f);
++    const float UpperBoost = FMath::Clamp(HFStrengthAnvil, 0.0f, 1.0f);
++    return FMath::Clamp(
++        MasterStrength
++            * (1.0f + UpperBoost * FMath::Clamp(HLocal, 0.0f, 1.0f)),
++        0.0f,
++        1.0f);
+ }
+ 
+ inline float EvaluateHFErosionThreshold(
+diff --git a/Plugins/SavageSuperStorm/Source/SavageSuperStormRuntime/Private/Tests/StormDensityContractTests.cpp b/Plugins/SavageSuperStorm/Source/SavageSuperStormRuntime/Private/Tests/StormDensityContractTests.cpp
+--- a/Plugins/SavageSuperStorm/Source/SavageSuperStormRuntime/Private/Tests/StormDensityContractTests.cpp
++++ b/Plugins/SavageSuperStorm/Source/SavageSuperStormRuntime/Private/Tests/StormDensityContractTests.cpp
+@@ -267,14 +267,18 @@ bool FStormDensityNoiseContractTest::RunTest(const FString& Parameters)
+     TestTrue(TEXT("HF strength no longer has a TopType center gate"),
+         FMath::IsNearlyEqual(
+             EvaluateHeightAwareHFStrength(0.45f, 0.25f, 0.55f),
+-            0.385f,
++            0.311875f,
+             1.0e-6f));
+-    TestEqual(TEXT("Zero base and anvil strengths disable HF erosion"),
+-        EvaluateHeightAwareHFStrength(0.90f, 0.0f, 0.0f), 0.0f);
+-    TestEqual(TEXT("Anvil strength is an explicit upper-column endpoint"),
+-        EvaluateHeightAwareHFStrength(1.0f, 0.0f, 0.75f), 0.75f);
+-    TestEqual(TEXT("Anvil strength does not leak into the lower endpoint"),
+-        EvaluateHeightAwareHFStrength(0.0f, 0.0f, 0.75f), 0.0f);
++    TestEqual(TEXT("Zero master disables HF even with a nonzero anvil boost"),
++        EvaluateHeightAwareHFStrength(0.90f, 0.0f, 1.0f), 0.0f);
++    TestTrue(TEXT("Anvil strength is a relative upper-column boost"),
++        FMath::IsNearlyEqual(
++            EvaluateHeightAwareHFStrength(1.0f, 0.25f, 0.55f),
++            0.3875f,
++            1.0e-6f));
++    TestEqual(TEXT("Anvil boost does not alter the lower endpoint"),
++        EvaluateHeightAwareHFStrength(0.0f, 0.25f, 0.75f), 0.25f);
+ 
+     const float PartialThreshold = EvaluateHFErosionThreshold(0.80f, 0.55f);
+     TestTrue(TEXT("HF density 0.8 at strength 0.55 produces threshold 0.11"),
+@@ -346,11 +350,11 @@ bool FStormDensityNoiseContractTest::RunTest(const FString& Parameters)
+         0.55f,
+         0.55f);
+     TestTrue(TEXT("Density-field HF produces the expected NoiseComposite"),
+-        FMath::IsNearlyEqual(RepresentativeNoise, 0.5505618f, 1.0e-6f));
++        FMath::IsNearlyEqual(RepresentativeNoise, 0.5212734f, 1.0e-6f));
+     TestTrue(TEXT("The density-field composite survives the canonical profile threshold"),
+         FMath::IsNearlyEqual(
+             EvaluateDensity(RepresentativeNoise, 0.70f, 1.0f),
+-            0.2505618f,
++            0.2212734f,
+             1.0e-6f));
+ 
+     const float StratusNoise = EvaluateNoiseCompositeFromSamples(
+@@ -413,12 +417,30 @@ bool FStormDensityNoiseContractTest::RunTest(const FString& Parameters)
+         CoverageLFRaw, HFMiddle, 1.0f, 0.50f, 0.45f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+     const float ZeroCoverageNoise = EvaluateNoiseCompositeFromSamples(
+         CoverageLFRaw, HFMiddle, 1.0f, 0.0f, 0.45f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
++    const float HFOffStratusNoise = EvaluateNoiseCompositeFromSamples(
++        CoverageLFRaw, HFLow, 1.0f, 0.50f, 0.12f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f);
++    const float HFOffRaggedBillowyNoise = EvaluateNoiseCompositeFromSamples(
++        CoverageLFRaw, HFHigh, 1.0f, 0.50f, 0.12f, 1.0f, 1.0f, 1.0f, 0.0f, 1.0f);
++    const float ExpectedHFOffNoise = ApplyCoverageToLF(0.80f, 0.50f);
+     TestTrue(TEXT("Full Coverage leaves LF unchanged before HF"),
+         FMath::IsNearlyEqual(FullCoverageNoise, 0.80f, 1.0e-6f));
+     TestTrue(TEXT("Half Coverage remaps LF before HF erosion"),
+         FMath::IsNearlyEqual(HalfCoverageNoise, 0.60f, 1.0e-6f));
+     TestEqual(TEXT("Zero Coverage deletes even an LF core before HF"),
+         ZeroCoverageNoise, 0.0f);
++    TestTrue(TEXT("Zero HF master preserves Coverage-shaped LF for stratus"),
++        FMath::IsNearlyEqual(HFOffStratusNoise, ExpectedHFOffNoise, 1.0e-6f));
++    TestTrue(TEXT("Zero HF master ignores BottomType and HF samples"),
++        FMath::IsNearlyEqual(
++            HFOffRaggedBillowyNoise,
++            ExpectedHFOffNoise,
++            1.0e-6f));
++    TestTrue(TEXT("Zero HF master makes different morphologies identical"),
++        FMath::IsNearlyEqual(
++            HFOffStratusNoise,
++            HFOffRaggedBillowyNoise,
++            1.0e-6f));
+     TestTrue(TEXT("Coverage-shaped LF is not attenuated a second time"),
+         FMath::IsNearlyEqual(
+             EvaluateDensity(HalfCoverageNoise, 1.0f, 1.0f),

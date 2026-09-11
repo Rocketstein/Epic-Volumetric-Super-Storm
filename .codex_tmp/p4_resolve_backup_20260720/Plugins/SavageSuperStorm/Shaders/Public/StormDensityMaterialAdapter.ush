@@ -1,0 +1,1084 @@
+#pragma once
+
+#include "/SavageSuperStormShaders/Public/StormDensityField.ush"
+
+>>>> ORIGINAL //depot/VolumetricSuperStorm/Plugins/SavageSuperStorm/Shaders/Public/StormDensityMaterialAdapter.ush#3
+// Adapter for the current M_SSS graph. LFPos/HFPos are already proportional,
+// storm-relative UVW coordinates produced by the material graph. Keeping this
+// adapter in USH makes the graph a wiring layer while the density contract and
+// noise morphology remain shared shader code.
+float StormEvaluateNoiseCompositeUVW(
+    Texture3D LFNoiseTex,
+    SamplerState LFNoiseSampler,
+    Texture3D HFNoiseTex,
+    SamplerState HFNoiseSampler,
+    Texture2D CurlNoiseTex,
+    SamplerState CurlNoiseSampler,
+    float3 LFUVW,
+    float3 HFUVW,
+    float CurlTiling,
+    float CurlDisplacementUVW,
+==== THEIRS //depot/VolumetricSuperStorm/Plugins/SavageSuperStorm/Shaders/Public/StormDensityMaterialAdapter.ush#4
+// LFMacroMax is an existing serialized input on MF_Erosion. The runtime owns
+// it as one hidden lifecycle value so formation exposes no tuning parameters:
+// [0,1) forming, 1 mature, [2,3) dissolving, 3 hidden.
+
+struct FStormLifecycleSample
+{
+    uint Mode; // 0 forming, 1 mature, 2 dissolving, 3 hidden
+    float Progress;
+};
+
+struct FStormDomainSample
+{
+    float MatureColumn;
+    float MatureStencil;
+    float FeederSupport;
+    float Radius01;
+    float2 BodyCoord;
+    float2 Radial;
+    float2 Tangent;
+};
+
+float StormTransportSmoother01(float Value)
+{
+    float x = saturate(Value);
+    return x * x * x * (x * (x * 6.0 - 15.0) + 10.0);
+}
+
+float2 StormTransportSafeDirection(float2 Value)
+{
+    float lengthSquared = dot(Value, Value);
+    return lengthSquared > 1.0e-8
+        ? Value * rsqrt(lengthSquared)
+        : float2(0.70710678, 0.70710678);
+}
+
+float StormTransportHash21(float2 Value)
+{
+    float2 p = frac(Value * float2(127.1, 311.7));
+    p += dot(p, p.yx + 74.7);
+    return frac(p.x * p.y);
+}
+
+float StormTransportValueNoise2D(float2 Position)
+{
+    float2 cell = floor(Position);
+    float2 local = frac(Position);
+    float2 blend = local * local * (3.0 - 2.0 * local);
+
+    float a = StormTransportHash21(cell);
+    float b = StormTransportHash21(cell + float2(1.0, 0.0));
+    float c = StormTransportHash21(cell + float2(0.0, 1.0));
+    float d = StormTransportHash21(cell + float2(1.0, 1.0));
+    return lerp(lerp(a, b, blend.x), lerp(c, d, blend.x), blend.y);
+}
+
+float StormTransportFBM2D(float2 Position)
+{
+    float value = 0.0;
+    float amplitude = 0.57;
+    value += amplitude * StormTransportValueNoise2D(Position);
+    Position = mul(float2x2(0.81, -0.59, 0.59, 0.81), Position) * 2.03 + 7.13;
+    amplitude *= 0.52;
+    value += amplitude * StormTransportValueNoise2D(Position);
+    Position = mul(float2x2(0.64, 0.77, -0.77, 0.64), Position) * 2.11 - 4.71;
+    amplitude *= 0.50;
+    value += amplitude * StormTransportValueNoise2D(Position);
+    return saturate(value);
+}
+
+float StormTransportMacro(float2 BodyCoord, float HLocal, float Salt)
+{
+    float2 q = BodyCoord * 2.07
+        + float2(HLocal * 0.79, -HLocal * 1.13)
+        + float2(Salt * 0.071, -Salt * 0.053);
+    float first = StormTransportFBM2D(q);
+    float second = StormTransportFBM2D(
+        q.yx * float2(-1.83, 1.67) + float2(9.31, -13.47));
+    return saturate(first * 0.66 + second * 0.34);
+}
+
+float StormTransportLane(float2 BodyCoord, float HLocal)
+{
+    float macroA = StormTransportMacro(BodyCoord, HLocal, 19.7);
+    float macroB = StormTransportMacro(
+        BodyCoord * float2(0.73, 1.31) + float2(macroA - 0.5, 0.0),
+        HLocal,
+        53.9);
+    float ridgeA = 1.0 - abs(macroA * 2.0 - 1.0);
+    float ridgeB = 1.0 - abs(macroB * 2.0 - 1.0);
+
+    // A weak, noise-warped angular bias lets incomplete inflow bands emerge,
+    // but the FBM ridges own most of the field so no equal sectors or clean
+    // mathematical spiral can appear.
+    float angle = atan2(BodyCoord.y, BodyCoord.x);
+    float radius = length(BodyCoord);
+    float angularBias = 0.5 + 0.5 * sin(
+        angle * lerp(1.37, 2.91, macroB)
+        + radius * lerp(2.2, 6.4, macroA)
+        + (macroA - macroB) * 4.9);
+    float broken = StormTransportMacro(
+        BodyCoord * 1.91 + float2(macroB, -macroA),
+        HLocal,
+        91.1);
+    return saturate(
+        ridgeA * 0.34
+        + ridgeB * 0.26
+        + angularBias * broken * 0.18
+        + broken * 0.22);
+}
+
+FStormLifecycleSample StormDecodeLifecycle(float EncodedControl)
+{
+    FStormLifecycleSample result;
+    if (EncodedControl >= 2.999)
+    {
+        result.Mode = 3u;
+        result.Progress = 1.0;
+    }
+    else if (EncodedControl >= 1.5)
+    {
+        result.Mode = 2u;
+        result.Progress = saturate(EncodedControl - 2.0);
+    }
+    else if (EncodedControl < 0.999)
+    {
+        result.Mode = 0u;
+        result.Progress = saturate(EncodedControl);
+    }
+    else
+    {
+        result.Mode = 1u;
+        result.Progress = 1.0;
+    }
+    return result;
+}
+
+FStormDomainSample StormDecodeTransportDomain(
+    float PackedStencil,
+    float BottomType,
+    float3 LFUVW)
+{
+    FStormDomainSample result;
+    result.MatureColumn = PackedStencil > 1.0 ? 1.0 : 0.0;
+    result.MatureStencil = result.MatureColumn > 0.5
+        ? saturate(PackedStencil - 1.0)
+        : 0.0;
+    result.FeederSupport = result.MatureColumn > 0.5
+        ? 1.0
+        : saturate(PackedStencil);
+
+    // The binder writes a zero StormReferenceCenter, so LFUVW.xy is truly
+    // storm-local and gives a continuous direction field around the actor.
+    result.Radial = StormTransportSafeDirection(LFUVW.xy);
+    result.Tangent = float2(-result.Radial.y, result.Radial.x);
+
+    // BottomType is monotonic over the authored body. FeederSupport extends
+    // that coordinate into the invisible surrounding low-cloud domain.
+    float centerGain = pow(saturate((BottomType - 0.20) / 0.70), 1.0 / 1.40);
+    float matureRadius = saturate(1.0 - centerGain);
+    float feederRadius = 1.0 + (1.0 - result.FeederSupport) * 0.68;
+    result.Radius01 = lerp(feederRadius, matureRadius, result.MatureColumn);
+    result.BodyCoord = result.Radial * result.Radius01;
+    return result;
+}
+
+float StormNoiseUnitsPerBodyRadius(float3 NoiseUVW, float2 BodyCoord, float MinimumScale)
+{
+    float bodyRadius = max(length(BodyCoord), 0.16);
+    return max(length(NoiseUVW.xy) / bodyRadius, MinimumScale);
+}
+
+float StormEvaluateNoiseCompositeUVW(
+    Texture3D LFNoiseTex,
+    SamplerState LFNoiseSampler,
+    Texture3D HFNoiseTex,
+    SamplerState HFNoiseSampler,
+    Texture2D CurlNoiseTex,
+    SamplerState CurlNoiseSampler,
+    float3 LFUVW,
+    float3 HFUVW,
+    float CurlTiling,
+    float CurlDisplacementUVW,
+==== YOURS //CptTangerine_Workspace/VolumetricSuperStorm/Plugins/SavageSuperStorm/Shaders/Public/StormDensityMaterialAdapter.ush
+// Adapter for the current MF_Erosion Custom node. The public argument list is
+// intentionally stable for saved material assets. Legacy underside-wispy and
+// Curl inputs are ABI pins only and do not affect density. BottomType and
+// TopType are used only for their independent profile LUT lookups.
+<<<<
+>>>> ORIGINAL //depot/VolumetricSuperStorm/Plugins/SavageSuperStorm/Shaders/Public/StormDensityMaterialAdapter.ush#3
+    float HLocal,
+    float TopType,
+    float HFStrength,
+    float HFStrengthAnvil,
+    out float OutCoarseNoise)
+{
+    float2 curlUV = frac(LFUVW.xy * max(abs(CurlTiling), 1.0e-3));
+    float2 curlVector = Texture2DSampleLevel(
+        CurlNoiseTex, CurlNoiseSampler, curlUV, 0).rg * 2.0 - 1.0;
+
+    // Curl warps only the HF coordinates and fades with physical cloud height.
+    float lowerCurlWeight = 1.0 - saturate(HLocal);
+    float3 warpedHFUVW = HFUVW;
+    warpedHFUVW.xy += curlVector
+        * CurlDisplacementUVW
+        * lowerCurlWeight;
+
+    float4 lfRaw = Texture3DSampleLevel(
+        LFNoiseTex, LFNoiseSampler, frac(LFUVW), 0);
+    // LFMacroMax remains in the public material ABI until its Custom-node pin
+    // can be removed. It must not alter the pre-shaped Perlin-Worley R.
+    float lfShape = StormDecodeLFPerlinWorley(lfRaw);
+    // The baked LF carrier is the complete low-frequency morphology. Auxiliary
+    // Worley channels and BottomType do not erode or pattern it.
+    float lfColumn = lfShape;
+    // Preserve the large-scale LF column before HF erosion. The underside
+    // ambient model uses this carrier to reject detached fine wisps without
+    // changing the final, fully eroded density returned by this function.
+    OutCoarseNoise = saturate(lfColumn);
+
+    float3 hfRaw = Texture3DSampleLevel(
+        HFNoiseTex, HFNoiseSampler, frac(warpedHFUVW), 0).rgb;
+    float hfFbmRaw = saturate(dot(
+        hfRaw, float3(0.625, 0.250, 0.125)));
+    FStormHFMorphologyResult hfMorphology = StormEvaluateHFMorphology(
+        hfFbmRaw,
+        TopType);
+    float effectiveHFStrength = StormEvaluateHeightAwareHFStrength(
+        HLocal, HFStrength, HFStrengthAnvil);
+    float erosionThreshold = StormEvaluateHFErosionThreshold(
+        hfMorphology.HFDensityField, effectiveHFStrength);
+    return StormEvaluateBaseCloudDensity(lfColumn, erosionThreshold);
+}
+
+==== THEIRS //depot/VolumetricSuperStorm/Plugins/SavageSuperStorm/Shaders/Public/StormDensityMaterialAdapter.ush#4
+    float HLocal,
+    float TopType,
+    float HFStrength,
+    float HFStrengthAnvil,
+    out float OutCoarseNoise)
+{
+    float2 curlUV = frac(LFUVW.xy * max(abs(CurlTiling), 1.0e-3));
+    float2 curlVector = Texture2DSampleLevel(
+        CurlNoiseTex, CurlNoiseSampler, curlUV, 0).rg * 2.0 - 1.0;
+
+    float lowerCurlWeight = 1.0 - saturate(HLocal);
+    float3 warpedHFUVW = HFUVW;
+    warpedHFUVW.xy += curlVector
+        * CurlDisplacementUVW
+        * lowerCurlWeight;
+
+    float4 lfRaw = Texture3DSampleLevel(
+        LFNoiseTex, LFNoiseSampler, frac(LFUVW), 0);
+    // LFMacroMax remains in the public material ABI until its Custom-node pin
+    // can be removed. It must not alter the pre-shaped Perlin-Worley R.
+    float lfShape = StormDecodeLFPerlinWorley(lfRaw);
+    // The baked LF carrier is the complete low-frequency morphology. Auxiliary
+    // Worley channels and BottomType do not erode or pattern it.
+    float lfColumn = lfShape;
+    // Preserve the large-scale LF column before HF erosion. The underside
+    // ambient model uses this carrier to reject detached fine wisps without
+    // changing the final, fully eroded density returned by this function.
+    OutCoarseNoise = saturate(lfColumn);
+
+    float3 hfRaw = Texture3DSampleLevel(
+        HFNoiseTex, HFNoiseSampler, frac(warpedHFUVW), 0).rgb;
+    float hfFbmRaw = saturate(dot(
+        hfRaw, float3(0.625, 0.250, 0.125)));
+    FStormHFMorphologyResult hfMorphology = StormEvaluateHFMorphology(
+        hfFbmRaw,
+        TopType);
+    float effectiveHFStrength = StormEvaluateHeightAwareHFStrength(
+        HLocal, HFStrength, HFStrengthAnvil);
+    float erosionThreshold = StormEvaluateHFErosionThreshold(
+        hfMorphology.HFDensityField, effectiveHFStrength);
+    return StormEvaluateBaseCloudDensity(lfColumn, erosionThreshold);
+}
+
+// Cyclonic handedness of the assembly animation. Flip to -1.0 if the spin-up
+// fights the mature storm's RotationSign on screen.
+static const float FormationSwirlSign = 1.0;
+
+float2 StormFormationFieldWarp(float2 BodyCoord, float HLocal, float Salt)
+{
+    // Low-cost continuous wave turbulence for the transport field. The
+    // incommensurate directions and nested phase warps avoid cells, sectors,
+    // periodic spokes, and expensive FBM evaluation inside the integration.
+    float2 q = BodyCoord * float2(1.13, 0.91)
+        + float2(HLocal * 0.23, -HLocal * 0.31);
+    float phaseA = dot(q, float2(1.71, -2.09))
+        + Salt * 0.113;
+    float phaseB = dot(q, float2(-2.83, 1.27))
+        - HLocal * 1.37
+        + Salt * 0.071;
+    float phaseC = dot(q, float2(4.11, 3.37))
+        + sin(phaseA) * 0.83
+        - cos(phaseB) * 0.61
+        + Salt * 0.037;
+    float2 field = float2(
+        sin(phaseA) * 0.52
+            + sin(phaseB * 0.73 + cos(phaseC)) * 0.31
+            + cos(phaseC) * 0.17,
+        cos(phaseB) * 0.49
+            + sin(phaseC * 0.67 + sin(phaseA)) * 0.34
+            - sin(phaseA * 0.47) * 0.17);
+    return clamp(field * 0.5, -0.5, 0.5);
+}
+
+float2 StormFormationBackwardDirection(
+    float2 BodyCoord,
+    float HLocal,
+    float StreamSalt,
+    out float OutChannel,
+    out float OutUpdraft)
+{
+    float radius = length(BodyCoord);
+    float2 originRadial = StormTransportSafeDirection(BodyCoord);
+    float2 fieldWarp = StormFormationFieldWarp(
+        BodyCoord,
+        HLocal,
+        StreamSalt);
+    float2 slowWarp = StormFormationFieldWarp(
+        BodyCoord * 0.59 + fieldWarp * 0.17,
+        HLocal * 0.71,
+        StreamSalt + 81.4);
+
+    // Convergence is toward a continuously wandering basin, never toward one
+    // exact common point. The backward field therefore produces curved,
+    // incomplete inflow corridors instead of a radial fan.
+    float2 wanderingCenter = slowWarp
+        * lerp(0.18, 0.34, saturate(radius));
+    float2 basinRadial = StormTransportSafeDirection(
+        BodyCoord - wanderingCenter);
+    float2 basinTangent = float2(-basinRadial.y, basinRadial.x);
+
+    float channelA = 0.5 + 0.5 * sin(
+        dot(BodyCoord + fieldWarp * 0.31, float2(2.17, -1.43))
+        + HLocal * 1.19
+        + StreamSalt * 0.047);
+    float channelB = 0.5 + 0.5 * sin(
+        dot(BodyCoord.yx + slowWarp * 0.27, float2(-3.31, 2.53))
+        - HLocal * 0.83
+        + StreamSalt * 0.029
+        + channelA * 1.71);
+    float channelRidge = 1.0 - abs(channelA * 2.0 - 1.0);
+    OutChannel = saturate(
+        channelA * 0.43
+        + channelB * 0.34
+        + channelRidge * 0.23);
+    OutUpdraft = saturate(
+        StormTransportSmoother01(
+            (OutChannel - 0.28) / 0.72)
+        * lerp(0.61, 1.0, channelB));
+
+    float meander = dot(fieldWarp, basinTangent) * 1.36
+        + (channelB - 0.5) * 0.63;
+    // A consistent tangential bias makes the inflow spiral instead of
+    // converging straight; it strengthens toward the centre like a cyclone.
+    float swirlBias = FormationSwirlSign
+        * lerp(0.85, 0.32, saturate(radius));
+    float2 crossDrift = (fieldWarp + slowWarp * 0.61)
+        * lerp(0.19, 0.39, saturate(radius));
+    float2 direction = StormTransportSafeDirection(
+        basinRadial
+        + basinTangent * (meander - swirlBias)
+        + crossDrift);
+
+    // Net convergence strengthens toward the centre so inflow reads as suction,
+    // while distant streams keep meandering, splitting, and bending.
+    float radialFloor = lerp(0.30, 0.12, saturate(radius));
+    float outwardDot = dot(direction, originRadial);
+    direction = StormTransportSafeDirection(
+        direction
+        + originRadial * max(radialFloor - outwardDot, 0.0) * 2.1);
+    return direction;
+}
+
+void StormBuildFormationTransport(
+    FStormDomainSample Domain,
+    float HLocal,
+    float HeightInside,
+    float GlobalProgress,
+    float3 LFUVW,
+    float3 HFUVW,
+    out float3 OutLFUVW,
+    out float3 OutHFUVW,
+    out float OutCondensation,
+    out float OutSourceMass,
+    out float OutSourceProfile,
+    out float OutBreakup,
+    out float OutSourceLifecycle)
+{
+    // The whole transport is evaluated in a frame that un-rotates as the storm
+    // assembles: corridors, basins, and the feeder band spin up cyclonically
+    // (faster near the centre) and land exactly on the canonical frame.
+    float swirlAngle = FormationSwirlSign
+        * (1.0 - GlobalProgress)
+        * lerp(1.9, 0.6, saturate(Domain.Radius01));
+    float swirlSin;
+    float swirlCos;
+    sincos(swirlAngle, swirlSin, swirlCos);
+    Domain.BodyCoord = float2(
+        Domain.BodyCoord.x * swirlCos - Domain.BodyCoord.y * swirlSin,
+        Domain.BodyCoord.x * swirlSin + Domain.BodyCoord.y * swirlCos);
+    Domain.Radial = float2(
+        Domain.Radial.x * swirlCos - Domain.Radial.y * swirlSin,
+        Domain.Radial.x * swirlSin + Domain.Radial.y * swirlCos);
+    Domain.Tangent = float2(-Domain.Radial.y, Domain.Radial.x);
+
+    float macro = StormTransportMacro(Domain.BodyCoord, HLocal, 41.3);
+    float pulse = StormTransportMacro(
+        Domain.BodyCoord * lerp(0.79, 1.43, macro),
+        HLocal,
+        83.9);
+    float2 fieldWarp = StormFormationFieldWarp(
+        Domain.BodyCoord,
+        HLocal,
+        127.1);
+    float lane = StormTransportLane(
+        Domain.BodyCoord + fieldWarp * 0.21,
+        HLocal);
+
+    // Local clocks are continuous but strongly non-uniform. No shared height
+    // threshold, ring index, cell owner, or angular sector controls them.
+    float startTime = saturate(
+        0.015
+        + (1.0 - lane) * lerp(0.06, 0.29, macro)
+        + Domain.Radius01 * lerp(0.005, 0.08, 1.0 - pulse)
+        + (StormTransportMacro(
+            Domain.BodyCoord * 1.17 + fieldWarp * 0.29,
+            HLocal,
+            159.7) - 0.5) * 0.19);
+    float duration = lerp(
+        0.34,
+        0.73,
+        StormTransportMacro(
+            Domain.BodyCoord * 1.07 - fieldWarp * 0.17,
+            HLocal,
+            181.9));
+    // Every local clock finishes by 0.92 so the exact mature identity is
+    // reached analytically, without a terminal global un-warp pass.
+    duration = min(duration, 0.92 - startTime);
+    float localProgress = StormTransportSmoother01(
+        (GlobalProgress - startTime) / max(duration, 0.08));
+    // Arrival accelerates: inflow speeds up as material closes on its basin.
+    float arrival = pow(localProgress, 1.55);
+
+    float captureNoise = StormTransportMacro(
+        Domain.BodyCoord * 0.74 + fieldWarp * 0.13,
+        HLocal,
+        223.7);
+    float captureRadius = lerp(0.19, 0.43, captureNoise);
+    float sourceRing = lerp(1.06, 1.48, macro)
+        + (pulse - 0.5) * 0.17;
+
+    // Moisture streams stop feeding every point all the way to the exact
+    // centre. They enter broad, wandering capture basins; the resolved target
+    // density then grows vertically inside those basins. This removes the
+    // mathematical starburst caused by direct radial convergence.
+    float captureMetric = Domain.Radius01
+        + dot(fieldWarp, Domain.Radial) * 0.24
+        + (lane - 0.5) * 0.14;
+    float captureGate = smoothstep(
+        captureRadius - 0.09,
+        captureRadius + 0.14,
+        captureMetric);
+    // Inverse advection: the sample offset starts at the source distance and
+    // shrinks to zero on arrival, so inflow plays forward and lands exactly on
+    // the mature identity. The backtrack is clamped so the sampled texture
+    // never stretches into long radial smears; the sense of travel comes from
+    // the moving boundary.
+    float travelDistance = min(
+        max(sourceRing + 0.20 - max(Domain.Radius01, captureRadius), 0.0),
+        0.50);
+    travelDistance *= (1.0 - arrival) * captureGate;
+
+    // Integrate the inverse map through a continuous meandering vector field.
+    // Four short steps are enough to bend and split paths without rotating the
+    // entire storm or creating a clean procedural spiral.
+    float2 sourceBody = Domain.BodyCoord;
+    float channelAccum = 0.0;
+    float updraftAccum = 0.0;
+    const float inverseStepCount = 4.0;
+    float inverseStepDistance = travelDistance / inverseStepCount;
+    [unroll]
+    for (int transportStep = 0; transportStep < 4; ++transportStep)
+    {
+        float channelStep;
+        float updraftStep;
+        float2 direction = StormFormationBackwardDirection(
+            sourceBody,
+            HLocal,
+            271.1 + float(transportStep) * 29.7,
+            channelStep,
+            updraftStep);
+        float stepJitter = lerp(
+            0.82,
+            1.18,
+            channelStep * 0.61 + updraftStep * 0.39);
+        sourceBody += direction * inverseStepDistance * stepJitter;
+        channelAccum += channelStep;
+        updraftAccum += updraftStep;
+    }
+    float flowChannel = saturate(channelAccum / inverseStepCount);
+    float flowUpdraft = saturate(updraftAccum / inverseStepCount);
+    // Map the spin-frame displacement back to the unrotated frame; as the
+    // frame unwinds this sweeps the sampled texture azimuthally as well.
+    float2 spinOffset = sourceBody - Domain.BodyCoord;
+    float2 bodyOffset = float2(
+        spinOffset.x * swirlCos + spinOffset.y * swirlSin,
+        -spinOffset.x * swirlSin + spinOffset.y * swirlCos);
+
+    float lfUnits = StormNoiseUnitsPerBodyRadius(
+        LFUVW, Domain.BodyCoord, 0.006);
+    float hfUnits = StormNoiseUnitsPerBodyRadius(
+        HFUVW, Domain.BodyCoord, 0.018);
+    OutLFUVW = LFUVW;
+    OutHFUVW = HFUVW;
+    OutLFUVW.xy += bodyOffset * lfUnits;
+    OutHFUVW.xy += bodyOffset * hfUnits;
+
+    // Backtrack vertically through the same moisture stream. The amount of
+    // rise is local to the capture corridor and changes continuously in XYZ;
+    // it is not derived from an animated top or a bottom-up reveal plane.
+    float innerCapture = 1.0 - smoothstep(
+        captureRadius + 0.04,
+        min(captureRadius + 0.57, 0.98),
+        captureMetric);
+    float riseClock = StormTransportSmoother01(
+        arrival * lerp(0.72, 1.16, flowChannel));
+    // The band climbs toward the storm's own height as it closes in. The climb
+    // is gated on actual proximity to the body, not on elapsed time — segments
+    // still outside stay a low deck, so no cylindrical wall rings the storm.
+    float approach = StormTransportSmoother01((arrival - 0.20) / 0.62)
+        * (1.0 - smoothstep(0.85, 1.30, Domain.Radius01));
+    // The coordinate rise settles as the plume merges into the body, so the
+    // endpoint needs no amplitude kill.
+    float liftBody = riseClock
+        * max(innerCapture, approach * 0.7)
+        * lerp(0.19, 0.91, flowUpdraft)
+        * lerp(0.34, 1.0, saturate(HLocal))
+        * (1.0 - arrival);
+    OutLFUVW.z -= liftBody * lfUnits * 0.58;
+    OutHFUVW.z -= liftBody * hfUnits * 0.78;
+
+    float sourceLane = StormTransportLane(
+        sourceBody + StormFormationFieldWarp(
+            sourceBody,
+            HLocal,
+            401.3) * 0.18,
+        HLocal);
+    float sourceMacro = StormTransportMacro(
+        sourceBody,
+        HLocal,
+        431.9);
+    // The feeder band lives in current space and migrates from the outer
+    // annulus to the capture rim as its material arrives, so absorption reads
+    // as inward motion instead of an in-place fade.
+    float annulusCenter = lerp(1.08, 1.44, sourceMacro)
+        + (sourceLane - 0.5) * 0.15;
+    float ringCenter = lerp(annulusCenter, captureRadius + 0.16, arrival);
+    float annulusHalfWidth = lerp(0.18, 0.40, pulse);
+    float annulusDistance = abs(Domain.Radius01 - ringCenter);
+    float annulus = 1.0 - smoothstep(
+        annulusHalfWidth * 0.48,
+        annulusHalfWidth,
+        annulusDistance);
+
+    float currentLane = StormTransportLane(
+        Domain.BodyCoord + fieldWarp * 0.34,
+        HLocal);
+    float broadMoisture = StormTransportMacro(
+        sourceBody * 0.53
+            + StormFormationFieldWarp(sourceBody, HLocal, 719.3) * 0.31,
+        HLocal,
+        480.0);
+    float moistureAvailability = smoothstep(
+        0.46,
+        0.67,
+        sourceMacro * 0.35 + broadMoisture * 0.65);
+    float sourceFilament = smoothstep(
+        0.50,
+        0.73,
+        sourceLane);
+    float currentCorridor = smoothstep(
+        0.50,
+        0.76,
+        currentLane * 0.62 + flowChannel * 0.38);
+    float brokenBand = saturate(
+        moistureAvailability
+        * sourceFilament
+        * lerp(0.42, 1.0, currentCorridor));
+
+    // Only a few strong continuous updraft corridors leak through the inner
+    // capture region. Most feeder material terminates in off-centre basins and
+    // condenses there, so no spokes meet at one point.
+    float innerCorridor = smoothstep(0.69, 0.91,
+        flowUpdraft * 0.72
+            + currentLane * 0.21
+            + sourceMacro * 0.07);
+    float coreAccess = lerp(captureGate, innerCorridor * 0.42, 1.0 - captureGate);
+    float accessibleDomain = saturate(max(
+        Domain.MatureColumn,
+        Domain.FeederSupport));
+    // Feeder patches are born staggered ahead of their transport clocks and
+    // drain as they arrive, not on a shared global window. The gate leaves
+    // through the Coverage remap so patches grow and erode at full density
+    // instead of fading translucent.
+    float handoff = 1.0 - StormTransportSmoother01(
+        (arrival - 0.55) / 0.45);
+    float birth = StormTransportSmoother01(
+        (GlobalProgress - startTime * 0.4) / 0.18);
+    OutSourceLifecycle = saturate(birth * handoff);
+    // Tall (climbing) segments survive only inside updraft corridors, so the
+    // band tears into separate towers instead of a continuous wall. The dense
+    // post-CL115 LF carrier no longer shreds the low band on its own.
+    float climbTear = lerp(
+        1.0,
+        smoothstep(0.30, 0.72, currentLane * 0.6 + flowUpdraft * 0.4),
+        approach);
+    OutSourceMass = saturate(
+        annulus
+        * brokenBand
+        * coreAccess
+        * accessibleDomain
+        * lerp(0.69, 1.0, pulse)
+        * climbTear);
+
+    // A shallow feeder layer rises only where a capture corridor is active.
+    // Its cap is spatially torn and continuously deformed, never a shared
+    // animated layer boundary.
+    // Strong corridors rise on their own; everything else still climbs with
+    // approach so no band segment stays glued to the layer floor.
+    float riseAmount = riseClock * max(
+        innerCapture * pow(saturate(flowUpdraft), 1.18),
+        approach * lerp(0.35, 1.0, saturate(flowUpdraft)));
+    float profileNoise = StormTransportMacro(
+        Domain.BodyCoord * 1.83
+            + sourceBody * 0.31
+            + float2(HLocal, -HLocal) * 0.17,
+        HLocal,
+        487.7);
+    // Feeders are born as a low deck and grow into congestus towers as their
+    // updraft corridors activate.
+    float shallowCap = lerp(0.42, 0.25, Domain.MatureColumn)
+        + (sourceMacro - 0.5) * lerp(0.11, 0.06, Domain.MatureColumn);
+    float plumeCap = saturate(
+        shallowCap
+        + riseAmount * lerp(0.60, 1.00, profileNoise));
+    // The base lifts off the floor near the rim: inflow bands slope upward
+    // into the updraft instead of staying a ground-hugging deck.
+    float plumeBase = saturate(
+        0.015
+        + riseAmount * lerp(0.00, 0.13, 1.0 - flowChannel)
+        + approach * lerp(0.04, 0.18, saturate(flowUpdraft))
+        + (profileNoise - 0.5) * 0.035);
+    float sourceBottom = smoothstep(
+        plumeBase - 0.08,
+        plumeBase + 0.09,
+        HLocal);
+    float sourceTop = 1.0 - smoothstep(
+        plumeCap - lerp(0.18, 0.10, flowUpdraft),
+        plumeCap + lerp(0.13, 0.20, profileNoise),
+        HLocal);
+    OutSourceProfile = saturate(
+        sourceBottom
+        * sourceTop
+        * HeightInside);
+
+    // Destination condensation is a residence-time field in moving capture
+    // basins. Height is one travel cost among several, not a global ordering.
+    float travelNoise = StormTransportMacro(
+        Domain.BodyCoord * 1.57
+            + fieldWarp * 0.28
+            + float2(HLocal * 0.23, -HLocal * 0.31),
+        HLocal,
+        541.1);
+    // Per-column tower speed keeps the growth frontier from sweeping up as a
+    // flat plane: fast columns shoot ahead as towers, slow ones lag into a
+    // staggered skyline, and the base breaks up instead of condensing at once.
+    float towerNoise = StormTransportMacro(
+        Domain.BodyCoord * 1.31 + fieldWarp * 0.21,
+        HLocal,
+        673.3);
+    float verticalCost = pow(
+        saturate(HLocal),
+        lerp(0.68, 1.83, pulse))
+        * lerp(0.12, 0.30, 1.0 - flowUpdraft)
+        * lerp(0.45, 1.75, towerNoise);
+    // Rescaled so every basin condenses on its own clock (the raw sum can
+    // exceed 1); the terminal settle is a narrow safety net, not the filler.
+    float basinArrival = max(
+        startTime
+        + verticalCost
+        + Domain.Radius01 * lerp(0.02, 0.12, 1.0 - macro)
+        + (travelNoise - 0.5) * 0.31
+        + (towerNoise - 0.5) * 0.14
+        - innerCapture * flowUpdraft * 0.17,
+        0.0) * 0.50 + 0.06;
+    float condensation = StormTransportSmoother01(
+        (GlobalProgress - basinArrival)
+        / lerp(0.12, 0.29, macro));
+    float settle = StormTransportSmoother01(
+        (GlobalProgress - 0.90) / 0.10);
+    OutCondensation = saturate(
+        lerp(condensation, 1.0, settle)
+        * Domain.MatureColumn);
+
+    float tearNoise = StormTransportMacro(
+        sourceBody * 2.37
+            + fieldWarp * 0.43
+            + float2(HLocal * 0.41, -HLocal * 0.27),
+        HLocal,
+        607.9);
+    OutBreakup = smoothstep(
+        0.29,
+        0.79,
+        tearNoise * 0.53
+            + sourceLane * 0.17
+            + currentLane * 0.16
+            + flowChannel * 0.14);
+}
+
+void StormBuildDissolutionTransport(
+    FStormDomainSample Domain,
+    float HLocal,
+    float GlobalProgress,
+    float3 LFUVW,
+    float3 HFUVW,
+    out float3 OutLFUVW,
+    out float3 OutHFUVW,
+    out float OutSurvival)
+{
+    float macro = StormTransportMacro(Domain.BodyCoord, HLocal, 367.3);
+    float shred = StormTransportMacro(Domain.BodyCoord * 2.19, HLocal, 419.9);
+    float lane = StormTransportLane(
+        Domain.BodyCoord.yx * float2(-1.0, 1.0), HLocal);
+    float startTime = saturate(
+        0.02
+        + (1.0 - macro) * 0.28
+        + Domain.Radius01 * 0.07
+        + (shred - 0.5) * 0.10);
+    float localBreak = StormTransportSmoother01(
+        (GlobalProgress - startTime) / lerp(0.39, 0.73, shred));
+
+    float2 shearDirection = StormTransportSafeDirection(
+        float2(0.83, 0.56)
+        + Domain.Tangent * (macro - 0.5) * 0.81);
+    float2 bodyOffset = -shearDirection
+        * localBreak
+        * lerp(0.12, 0.91, shred)
+        * lerp(0.35, 1.0, HLocal);
+    bodyOffset += Domain.Tangent
+        * (macro - 0.5)
+        * localBreak
+        * 0.27;
+
+    float lfUnits = StormNoiseUnitsPerBodyRadius(LFUVW, Domain.BodyCoord, 0.006);
+    float hfUnits = StormNoiseUnitsPerBodyRadius(HFUVW, Domain.BodyCoord, 0.018);
+    OutLFUVW = LFUVW;
+    OutHFUVW = HFUVW;
+    OutLFUVW.xy += bodyOffset * lfUnits;
+    OutHFUVW.xy += bodyOffset * hfUnits;
+    OutLFUVW.z += localBreak
+        * lerp(0.02, 0.24, HLocal)
+        * shred
+        * lfUnits;
+    OutHFUVW.z += localBreak
+        * lerp(0.05, 0.43, HLocal)
+        * shred
+        * hfUnits;
+
+    float baseSupplyLoss = localBreak
+        * lerp(1.16, 0.68, HLocal)
+        * lerp(0.69, 1.31, lane);
+    float filament = smoothstep(
+        0.28,
+        0.78,
+        shred + StormTransportMacro(
+            Domain.BodyCoord * 1.71,
+            HLocal,
+            463.7) * 0.27);
+    float terminalFade = 1.0 - StormTransportSmoother01(
+        (GlobalProgress - 0.82) / 0.18);
+    OutSurvival = saturate(
+        (1.0 - StormTransportSmoother01(baseSupplyLoss))
+        * lerp(1.0, filament, localBreak * 0.70)
+        * lerp(1.0, terminalFade, localBreak));
+}
+
+==== YOURS //CptTangerine_Workspace/VolumetricSuperStorm/Plugins/SavageSuperStorm/Shaders/Public/StormDensityMaterialAdapter.ush
+<<<<
+float StormEvaluateMaterialDensity(
+    Texture2D BottomProfileTex,
+    SamplerState BottomProfileSampler,
+    Texture2D TopProfileTex,
+    SamplerState TopProfileSampler,
+    Texture3D LFNoiseTex,
+    SamplerState LFNoiseSampler,
+    Texture3D HFNoiseTex,
+    SamplerState HFNoiseSampler,
+    Texture2D CurlNoiseTex,
+    SamplerState CurlNoiseSampler,
+    float Coverage,
+    float HLocal,
+    float HeightInside,
+    float BottomType,
+    float TopType,
+    float StormStencil,
+    float AnvilStrength,
+    float AnvilDepth,
+    float3 LFUVW,
+    float3 HFUVW,
+    float2 CurlUVW,
+    float CurlTiling,
+    float CurlDisplacementUVW,
+    float LFMacroMax,
+    float BottomWispyStrength,
+    float BottomHFStrength,
+    float BottomCurlStrength,
+    float HFStrength,
+    float HFStrengthAnvil,
+    out float OutCoarseDensity)
+{
+    FStormLifecycleSample lifecycle = StormDecodeLifecycle(LFMacroMax);
+    if (lifecycle.Mode == 3u)
+    {
+        OutCoarseDensity = 0.0;
+        return 0.0;
+    }
+
+    float h = saturate(HLocal);
+    FStormDomainSample domain = StormDecodeTransportDomain(
+        StormStencil, BottomType, LFUVW);
+
+    // 1. LF shape. LF packed Worley channels use positive FBM weights.
+    float4 lfRaw = Texture3DSampleLevel(
+        LFNoiseTex,
+        LFNoiseSampler,
+        frac(LFUVW),
+        0);
+    float lfShape = StormDecodeNubisLFShape(lfRaw);
+
+    // 2. Split vertical profile: independently look up the Bottom and Top
+    // types, then multiply the two lookup results exactly once.
+    float bottomProfile = StormEvaluateBottomTypeProfile(
+        BottomProfileTex,
+        BottomProfileSampler,
+        h,
+        BottomType);
+    float topProfile = StormEvaluateCloudTypeProfile(
+        TopProfileTex,
+        TopProfileSampler,
+        h,
+        TopType);
+    float verticalProfile = StormEvaluateBottomTopVerticalProfile(
+        bottomProfile,
+        topProfile);
+
+    // 3. 2015 Coverage: remap against 1-Coverage, then multiply by Coverage.
+    // Coarse density ends here, before Curl and HF are sampled.
+    float coveredBaseCloud = StormEvaluateCoveredBaseCloud(
+        lfShape,
+        verticalProfile,
+        Coverage);
+    OutCoarseDensity = StormApplyDensityMasks(
+        coveredBaseCloud,
+        HeightInside,
+        StormStencil);
+
+>>>> ORIGINAL //depot/VolumetricSuperStorm/Plugins/SavageSuperStorm/Shaders/Public/StormDensityMaterialAdapter.ush#3
+    float coarseNoise = 0.0;
+    float normalNoise = StormEvaluateNoiseCompositeUVW(
+        LFNoiseTex,
+        LFNoiseSampler,
+        HFNoiseTex,
+        HFNoiseSampler,
+        CurlNoiseTex,
+        CurlNoiseSampler,
+        LFUVW,
+        HFUVW,
+        CurlTiling,
+        CurlDisplacementUVW,
+        LFMacroMax,
+        h,
+        TopType,
+        HFStrength,
+        HFStrengthAnvil,
+        coarseNoise);
+==== THEIRS //depot/VolumetricSuperStorm/Plugins/SavageSuperStorm/Shaders/Public/StormDensityMaterialAdapter.ush#4
+    // Exact mature endpoint: byte-for-byte compatible density ordering, with
+    // no transport, feeder density, or lifecycle multiplier.
+    if (lifecycle.Mode == 1u)
+    {
+        float matureCoarse = 0.0;
+        float matureNoise = StormEvaluateNoiseCompositeUVW(
+            LFNoiseTex, LFNoiseSampler,
+            HFNoiseTex, HFNoiseSampler,
+            CurlNoiseTex, CurlNoiseSampler,
+            LFUVW, HFUVW,
+            CurlTiling, CurlDisplacementUVW,
+            h, TopType,
+            HFStrength, HFStrengthAnvil,
+            matureCoarse);
+        OutCoarseDensity = StormEvaluateDensity(
+            matureCoarse,
+            verticalProfile,
+            Coverage,
+            domain.MatureStencil);
+        return StormEvaluateDensity(
+            matureNoise,
+            verticalProfile,
+            Coverage,
+            domain.MatureStencil);
+    }
+
+    if (lifecycle.Mode == 0u)
+    {
+        float3 transportedLF;
+        float3 transportedHF;
+        float condensation;
+        float sourceMass;
+        float sourceProfile;
+        float breakup;
+        float sourceLifecycle;
+        StormBuildFormationTransport(
+            domain,
+            h,
+            HeightInside,
+            lifecycle.Progress,
+            LFUVW,
+            HFUVW,
+            transportedLF,
+            transportedHF,
+            condensation,
+            sourceMass,
+            sourceProfile,
+            breakup,
+            sourceLifecycle);
+
+        float coarseNoise = 0.0;
+        float transportedNoise = StormEvaluateNoiseCompositeUVW(
+            LFNoiseTex, LFNoiseSampler,
+            HFNoiseTex, HFNoiseSampler,
+            CurlNoiseTex, CurlNoiseSampler,
+            transportedLF, transportedHF,
+            CurlTiling, CurlDisplacementUVW,
+            h, TopType,
+            HFStrength, HFStrengthAnvil,
+            coarseNoise);
+
+        // Growth reveals whole LF-scale clumps at full density: a falling
+        // threshold on the coarse carrier admits large connected blobs first,
+        // so no storm-silhouette speckle ghost ever pre-renders the endpoint.
+        float destinationClumpEdge = lerp(1.05, -0.12, condensation);
+        float destinationClump = smoothstep(
+            destinationClumpEdge,
+            destinationClumpEdge + 0.12,
+            coarseNoise);
+        float destinationFine = StormEvaluateDensity(
+            transportedNoise,
+            verticalProfile,
+            Coverage,
+            domain.MatureStencil) * destinationClump;
+        float destinationCoarse = StormEvaluateDensity(
+            coarseNoise,
+            verticalProfile,
+            Coverage,
+            domain.MatureStencil) * destinationClump;
+
+        float sourceClumpEdge = lerp(1.05, -0.12, sourceLifecycle);
+        float sourceClump = smoothstep(
+            sourceClumpEdge,
+            sourceClumpEdge + 0.12,
+            coarseNoise);
+        float sourceCoverage = lerp(0.41, 0.74, breakup);
+        float sourceFine = StormEvaluateDensity(
+            transportedNoise,
+            sourceProfile,
+            sourceCoverage,
+            sourceMass) * sourceClump;
+        float sourceCoarse = StormEvaluateDensity(
+            coarseNoise,
+            sourceProfile,
+            sourceCoverage,
+            sourceMass) * sourceClump;
+
+        // The source field is advected into the destination and condenses there.
+        // A max-union avoids a uniform whole-volume crossfade.
+        OutCoarseDensity = saturate(max(destinationCoarse, sourceCoarse));
+        return saturate(max(destinationFine, sourceFine));
+    }
+
+    float3 dissolvedLF;
+    float3 dissolvedHF;
+    float survival;
+    StormBuildDissolutionTransport(
+        domain,
+        h,
+        lifecycle.Progress,
+        LFUVW,
+        HFUVW,
+        dissolvedLF,
+        dissolvedHF,
+        survival);
+
+    float coarseNoise = 0.0;
+    float dissolvedNoise = StormEvaluateNoiseCompositeUVW(
+        LFNoiseTex, LFNoiseSampler,
+        HFNoiseTex, HFNoiseSampler,
+        CurlNoiseTex, CurlNoiseSampler,
+        dissolvedLF, dissolvedHF,
+        CurlTiling, CurlDisplacementUVW,
+        h, TopType,
+        HFStrength, HFStrengthAnvil,
+        coarseNoise);
+    // Dissolution eats the cloud clump by clump: a rising threshold on the
+    // coarse carrier removes whole LF blobs at full density, reaching truly
+    // empty before Hidden without a translucent fade or a speckle ghost.
+    float survivalClumpEdge = lerp(1.05, -0.12, survival);
+    float survivalClump = smoothstep(
+        survivalClumpEdge,
+        survivalClumpEdge + 0.12,
+        coarseNoise);
+==== YOURS //CptTangerine_Workspace/VolumetricSuperStorm/Plugins/SavageSuperStorm/Shaders/Public/StormDensityMaterialAdapter.ush
+    // 4. Apply the common HF erosion without a BottomType-driven warp,
+    // mask, strength override, or second density branch.
+    float3 hfRaw = Texture3DSampleLevel(
+        HFNoiseTex,
+        HFNoiseSampler,
+        frac(HFUVW),
+        0).rgb;
+    float hfFBM = StormDecodeNubisHFFBM(hfRaw);
+    float hfErosionThresholdPattern =
+        StormEvaluateHeightDependentHFModifier(hfFBM, h);
+    float fineDensity = StormApplyHFErosion(
+        coveredBaseCloud,
+        hfErosionThresholdPattern,
+        HFStrength);
+    return StormApplyDensityMasks(
+        fineDensity,
+        HeightInside,
+<<<<
+>>>> ORIGINAL //depot/VolumetricSuperStorm/Plugins/SavageSuperStorm/Shaders/Public/StormDensityMaterialAdapter.ush#3
+        StormStencil);
+
+    // Canonical order: LF -> HF erosion -> profile -> raw Coverage remap.
+    // BottomType affects only the authored lower-boundary profile. The retained
+    // BottomWispyStrength ABI input cannot alter LF or HF noise morphology.
+    // ShapeRT2.G is intentionally unused.
+    return StormEvaluateDensity(
+        normalNoise,
+        verticalProfile,
+        Coverage,
+==== THEIRS //depot/VolumetricSuperStorm/Plugins/SavageSuperStorm/Shaders/Public/StormDensityMaterialAdapter.ush#4
+        domain.MatureStencil) * survivalClump;
+    return StormEvaluateDensity(
+        dissolvedNoise,
+        verticalProfile,
+        Coverage,
+==== YOURS //CptTangerine_Workspace/VolumetricSuperStorm/Plugins/SavageSuperStorm/Shaders/Public/StormDensityMaterialAdapter.ush
+<<<<
+        domain.MatureStencil) * survivalClump;
+}

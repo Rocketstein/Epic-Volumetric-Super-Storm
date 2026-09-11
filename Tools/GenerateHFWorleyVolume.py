@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the SavageSuperStorm raw-octave HF volume texture.
+"""Generate the VolumetricSuperStorm raw-octave HF volume texture.
 
 The output is an uncompressed R8G8B8A8_UNORM Texture3D DDS. RGB contains
 three independent, periodic inverted-Worley octaves in ascending frequency;

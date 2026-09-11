@@ -1,0 +1,44 @@
+﻿{
+	"devices": [
+		{
+			"deviceName": "DESKTOP-N8H5EB1",
+			"instance": "12F00B0F40A0E93CC2E3ED9306623AEC",
+			"instanceName": "DESKTOP-N8H5EB1-13280",
+			"platform": "WindowsEditor",
+			"oSVersion": "Windows 11 (25H2) [10.0.26200.8894] ",
+			"model": "Default",
+			"gPU": "NVIDIA GeForce RTX 5060",
+			"cPUModel": "Intel(R) Core(TM) i7-14700",
+			"rAMInGB": 32,
+			"renderMode": "SM6",
+			"rHI": "",
+			"appInstanceLog": ""
+		}
+	],
+	"reportCreatedOn": "2026.07.27-11.49.01",
+	"succeeded": 1,
+	"succeededWithWarnings": 0,
+	"failed": 0,
+	"notRun": 0,
+	"inProcess": 0,
+	"totalDuration": 0.0093038007616996765,
+	"comparisonExported": false,
+	"comparisonExportDirectory": "",
+	"tests": [
+		{
+			"testDisplayName": "ActiveOwnership",
+			"fullTestPath": "SavageSuperStorm.Density.Spiral.V16.ActiveOwnership",
+			"tags": [],
+			"state": "Success",
+			"deviceInstance": [
+				"12F00B0F40A0E93CC2E3ED9306623AEC"
+			],
+			"duration": 0.0093038007616996765,
+			"dateTime": "2026.07.27-11.49.01",
+			"entries": [],
+			"warnings": 0,
+			"errors": 0,
+			"artifacts": []
+		}
+	]
+}

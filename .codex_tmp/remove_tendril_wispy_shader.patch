@@ -1,0 +1,60 @@
+*** Begin Patch
+*** Update File: Plugins/SavageSuperStorm/Shaders/Public/StormDensityMaterialAdapter.ush
+@@
+     float BaseBottomType,
+     float TopType,
+     float StormStencil,
+-    float SpiralTendrilMask,
+-    float SpiralTendrilStrength,
+     float3 WorldPosition,
+@@
+-    // The tendril is morphology demand, not occupancy. BaseBottomType also
+-    // supplies its strength, while the lower-band extent stays fixed.
+-    float undersideBand = StormEvaluateSpiralUndersideBand(
+-        h,
+-        BaseBottomType);
+-    float effectiveBottomType = lerp(
+-        saturate(BaseBottomType),
+-        1.0,
+-        saturate(SpiralTendrilMask)
+-            * saturate(SpiralTendrilStrength)
+-            * undersideBand
+-            * saturate(domain.SuperstormCoverage));
+-
+-    // EffectiveBottomType belongs only to the normal underside path.
++    // Wispy selection is owned exclusively by the authored BaseBottomType.
++    // ShapeRT2.G (SpiralTendrilMask) is intentionally not part of density.
+     float bottomProfile = StormEvaluateBottomTypeProfile(
+         BottomProfileTex,
+         BottomProfileSampler,
+         h,
+-        effectiveBottomType);
++        BaseBottomType);
+@@
+-            effectiveBottomType,
++            BaseBottomType,
+@@
+-            effectiveBottomType,
++            BaseBottomType,
+@@
+-        effectiveBottomType,
++        BaseBottomType,
+*** Update File: Plugins/SavageSuperStorm/Shaders/Public/StormDensityField.ush
+@@
+-// EffectiveBottomType selects weakly correlated underside HF carriers inside a
+-// fixed lower band. It never expands the band or adds a second remap.
++// BaseBottomType selects weakly correlated underside HF carriers inside a
++// fixed lower band. SpiralTendrilMask never affects the Wispy/HF path.
+@@
+-float StormEvaluateSpiralUndersideBand(
+-    float HLocal,
+-    float BaseBottomType)
+-{
+-    // BottomType controls demand/strength only. The lower-band extent remains
+-    // fixed at the former maximum (0.30) for every column.
+-    return (1.0 - StormEvaluateWispyToBillowyBlend(HLocal))
+-        * StormEvaluateBottomTypeWispyAmount(BaseBottomType);
+-}
+-
+ float StormEvaluateUndersideCurlWeight(
+*** End Patch

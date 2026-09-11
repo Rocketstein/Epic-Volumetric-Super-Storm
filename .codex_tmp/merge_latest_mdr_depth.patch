@@ -1,0 +1,167 @@
+diff --git a/Plugins/SavageSuperStorm/Shaders/Public/StormDensityLatestMDRAdapter.ush b/Plugins/SavageSuperStorm/Shaders/Public/StormDensityLatestMDRAdapter.ush
+--- a/Plugins/SavageSuperStorm/Shaders/Public/StormDensityLatestMDRAdapter.ush
++++ b/Plugins/SavageSuperStorm/Shaders/Public/StormDensityLatestMDRAdapter.ush
+@@ -311,6 +311,7 @@ float StormEvaluateMaterialDensityMDRLatest(
+     float BodyHeightDensityPower,
+     float DensityGamma,
+     float HFStrength,
++    float AnvilDepth01,
+     float2 MDRBodyCoord,
+     float4 MDRBoundaries0,
+     float4 MDRBoundaries1,
+@@ -362,16 +363,16 @@ float StormEvaluateMaterialDensityMDRLatest(
+     float bodyVerticalProfile = saturate(
+         normalProfile * bodyHeightDensityRamp);
+ 
+-    // This compatibility material has no serialized AnvilDepth01 pin, so one
+-    // preserves its historical anchor-to-bottom window.
++    // Keep the current MF_Erosion Anvil depth window when that ABI supplies it.
++    // Legacy callers pass one to preserve their historical anchor-to-bottom window.
+     float anvilCoord = StormEvaluateAnvilCoord(
+         CloudLayerHeight01,
+         AnvilAnchorHeight01,
+-        1.0);
++        AnvilDepth01);
+     float anvilHeightMask = StormEvaluateAnvilHeightMask(
+         CloudLayerHeight01,
+         AnvilAnchorHeight01,
+-        1.0);
++        AnvilDepth01);
+     float anvilProfile = StormEvaluateAnvilProfileDensity(
+         AnvilProfileTex,
+         AnvilProfileSampler,
+@@ -805,6 +806,7 @@ float StormEvaluateMaterialDensityMDRLatest(
+         1.0,
+         DensityGamma,
+         HFStrength,
++        1.0,
+         MDRBodyCoord,
+         MDRBoundaries0,
+         MDRBoundaries1,
+@@ -820,3 +822,131 @@ float StormEvaluateMaterialDensityMDRLatest(
+         OutCoarseDensity
+     );
+ }
++
++// Current MF_Erosion ABI plus six-ring MDR motion. The existing density,
++// phased Flow, Anvil profile, height twist, and Anvil depth inputs are retained.
++float StormEvaluateMaterialDensityMDRLatest(
++    Texture2D BottomProfileTex,
++    SamplerState BottomProfileSampler,
++    Texture2D TopProfileTex,
++    SamplerState TopProfileSampler,
++    Texture2D AnvilProfileTex,
++    SamplerState AnvilProfileSampler,
++    Texture3D LFNoiseTex,
++    SamplerState LFNoiseSampler,
++    Texture3D HFNoiseTex,
++    SamplerState HFNoiseSampler,
++    Texture2D CurlNoiseTex,
++    SamplerState CurlNoiseSampler,
++    float Coverage,
++    float HLocal,
++    float HeightInside,
++    float CloudLayerHeight01,
++    float BaseBottomType,
++    float TopType,
++    float StormStencil,
++    float3 WorldPosition,
++    float3 StormCenterRadius,
++    float3 LFUVW,
++    float3 HFUVW,
++    float3 FlowOffsetA,
++    float3 FlowOffsetB,
++    float FlowWeightA,
++    float2 CurlUVW,
++    float LFUnitsPerBodyRadius,
++    float HFUnitsPerBodyRadius,
++    float CurlUnitsPerBodyRadius,
++    float CurlTiling,
++    float CurlDisplacementUVW,
++    float StormLifecycleControl,
++    float RotationSign,
++    float OuterBrimRadiusScale,
++    float AnvilCoverageField,
++    float ShapeTwistRadians,
++    float SpiralTwistPower,
++    float LegacySpiralInnerRadius01,
++    float LegacySpiralOuterRadius01,
++    float AnvilStrength,
++    float AnvilAnchorHeight01,
++    float AnvilDepth01,
++    float DensityGamma,
++    float HFStrength,
++    float2 MDRBodyCoord,
++    float4 MDRBoundaries0,
++    float4 MDRBoundaries1,
++    float4 MDRSpeeds0,
++    float4 MDRSpeeds1,
++    float4 MDRPhases0,
++    float4 MDRPhases1,
++    float4 MDRSkews0,
++    float4 MDRSkews1,
++    float4 MDRControl0,
++    float4 MDRControl1,
++    out float OutCoarseDensity)
++{
++    return StormEvaluateMaterialDensityMDRLatest(
++        BottomProfileTex,
++        BottomProfileSampler,
++        TopProfileTex,
++        TopProfileSampler,
++        AnvilProfileTex,
++        AnvilProfileSampler,
++        LFNoiseTex,
++        LFNoiseSampler,
++        HFNoiseTex,
++        HFNoiseSampler,
++        CurlNoiseTex,
++        CurlNoiseSampler,
++        Coverage,
++        HLocal,
++        HeightInside,
++        CloudLayerHeight01,
++        BaseBottomType,
++        TopType,
++        StormStencil,
++        WorldPosition,
++        StormCenterRadius,
++        LFUVW,
++        HFUVW,
++        FlowOffsetA,
++        FlowOffsetB,
++        FlowWeightA,
++        CurlUVW,
++        LFUnitsPerBodyRadius,
++        HFUnitsPerBodyRadius,
++        CurlUnitsPerBodyRadius,
++        CurlTiling,
++        CurlDisplacementUVW,
++        StormLifecycleControl,
++        RotationSign,
++        OuterBrimRadiusScale,
++        AnvilCoverageField,
++        ShapeTwistRadians,
++        SpiralTwistPower,
++        AnvilStrength,
++        AnvilAnchorHeight01,
++        0.35,
++        1.0,
++        DensityGamma,
++        HFStrength,
++        AnvilDepth01,
++        MDRBodyCoord,
++        MDRBoundaries0,
++        MDRBoundaries1,
++        MDRSpeeds0,
++        MDRSpeeds1,
++        MDRPhases0,
++        MDRPhases1,
++        MDRSkews0,
++        MDRSkews1,
++        MDRControl0,
++        MDRControl1,
++        1u,
++        OutCoarseDensity
++    );
++}

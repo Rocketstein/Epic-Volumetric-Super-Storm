@@ -1,0 +1,49 @@
+// Copyright 2026 GoroGoro. All Rights Reserved.
+
+/**
+ * @file StormProfileField.ush
+ * @brief Evaluates sampled bottom, top, and anvil profile fields.
+ */
+
+#pragma once
+
+float ResolveBottomTypeFadeWidth(float BottomFade, float BottomType)
+{
+	float type01     = saturate(BottomType);
+	float smoothType = type01 * type01 * (3.0 - 2.0 * type01);
+
+	return min(max(BottomFade, 0.0) * smoothType, 1.0);
+}
+
+float4 EvaluateBottomTypeProfile(float2 UV, float BottomFade)
+{
+	float BottomType = saturate(UV.x);
+	float Height01   = saturate(1.0 - UV.y);
+
+	float FadeWidth = max(ResolveBottomTypeFadeWidth(BottomFade, BottomType), 1e-4);
+
+	float Profile = smoothstep(0.0, FadeWidth, Height01);
+
+	return float4(Profile.xxx, 1.0);
+}
+
+float4 EvaluateTopTypeProfile(float2 UV, float TopFade, float CurveTopHeight)
+{
+	float Height01         = saturate(1.0 - UV.y);
+	float DesiredTopHeight = saturate(CurveTopHeight);
+
+	float FadeWidth = max(TopFade, 1e-4);
+	float TopHeight = saturate(DesiredTopHeight);
+	float Profile   = 1.0 - smoothstep(TopHeight - FadeWidth, TopHeight, Height01);
+	return float4(Profile.xxx, 1.0);
+}
+
+float4 EvaluateAnvilTypeProfile(float2 UV, float AnvilFade, float CurveDepth)
+{
+	float DistanceDown01 = saturate(UV.y);
+	float DesiredDepth   = saturate(CurveDepth);
+
+	float FadeWidth = max(AnvilFade, 1e-4);
+	float Profile   = 1.0 - smoothstep(DesiredDepth - FadeWidth, DesiredDepth, DistanceDown01);
+	return float4(Profile.xxx, 1.0);
+}

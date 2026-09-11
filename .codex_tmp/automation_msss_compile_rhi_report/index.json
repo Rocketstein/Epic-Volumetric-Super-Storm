@@ -1,0 +1,44 @@
+﻿{
+	"devices": [
+		{
+			"deviceName": "DESKTOP-N8H5EB1",
+			"instance": "73249D0C4985A95C9080C8BEFAA28B8B",
+			"instanceName": "DESKTOP-N8H5EB1-8884",
+			"platform": "WindowsEditor",
+			"oSVersion": "Windows 11 (25H2) [10.0.26200.8894] ",
+			"model": "Default",
+			"gPU": "NVIDIA GeForce RTX 5060",
+			"cPUModel": "Intel(R) Core(TM) i7-14700",
+			"rAMInGB": 32,
+			"renderMode": "D3D12_SM6",
+			"rHI": "D3D12 (SM6)",
+			"appInstanceLog": ""
+		}
+	],
+	"reportCreatedOn": "2026.07.27-11.48.00",
+	"succeeded": 1,
+	"succeededWithWarnings": 0,
+	"failed": 0,
+	"notRun": 0,
+	"inProcess": 0,
+	"totalDuration": 23.936313629150391,
+	"comparisonExported": false,
+	"comparisonExportDirectory": "",
+	"tests": [
+		{
+			"testDisplayName": "MSSSCompile",
+			"fullTestPath": "SavageSuperStorm.Density.Material.MSSSCompile",
+			"tags": [],
+			"state": "Success",
+			"deviceInstance": [
+				"73249D0C4985A95C9080C8BEFAA28B8B"
+			],
+			"duration": 23.936313629150391,
+			"dateTime": "2026.07.27-11.47.36",
+			"entries": [],
+			"warnings": 0,
+			"errors": 0,
+			"artifacts": []
+		}
+	]
+}

@@ -1,0 +1,1834 @@
+#pragma once
+
+#include "/SavageSuperStormShaders/Public/StormDensityField.ush"
+#include "/SavageSuperStormShaders/Public/StormMotionField.ush"
+
+// LFMacroMax is an existing serialized input on MF_Erosion. The runtime owns
+// it as one hidden lifecycle value so formation exposes no tuning parameters:
+// [0,1) forming, 1 mature, [2,3) dissolving, 3 hidden.
+
+struct FStormLifecycleSample
+{
+    uint Mode; // 0 forming, 1 mature, 2 dissolving, 3 hidden
+    float Progress;
+};
+
+struct FStormDomainSample
+{
+    float MatureColumn;
+    float MatureStencil;
+    float FeederSupport;
+    float FeederActive;
+    float Radius01;
+    float2 BodyCoord;
+    float2 Radial;
+    float2 Tangent;
+};
+
+float StormTransportSmoother01(float Value)
+{
+    float x = saturate(Value);
+    return x * x * x * (x * (x * 6.0 - 15.0) + 10.0);
+}
+
+float2 StormTransportSafeDirection(float2 Value)
+{
+    float lengthSquared = dot(Value, Value);
+    return lengthSquared > 1.0e-8
+        ? Value * rsqrt(lengthSquared)
+        : float2(0.70710678, 0.70710678);
+}
+
+float StormTransportHash21(float2 Value)
+{
+    float2 p = frac(Value * float2(127.1, 311.7));
+    p += dot(p, p.yx + 74.7);
+    return frac(p.x * p.y);
+}
+
+float StormTransportValueNoise2D(float2 Position)
+{
+    float2 cell = floor(Position);
+    float2 local = frac(Position);
+    float2 blend = local * local * (3.0 - 2.0 * local);
+
+    float a = StormTransportHash21(cell);
+    float b = StormTransportHash21(cell + float2(1.0, 0.0));
+    float c = StormTransportHash21(cell + float2(0.0, 1.0));
+    float d = StormTransportHash21(cell + float2(1.0, 1.0));
+    return lerp(lerp(a, b, blend.x), lerp(c, d, blend.x), blend.y);
+}
+
+float StormTransportFBM2D(float2 Position)
+{
+    float value = 0.0;
+    float amplitude = 0.57;
+    value += amplitude * StormTransportValueNoise2D(Position);
+    Position = mul(float2x2(0.81, -0.59, 0.59, 0.81), Position) * 2.03 + 7.13;
+    amplitude *= 0.52;
+    value += amplitude * StormTransportValueNoise2D(Position);
+    Position = mul(float2x2(0.64, 0.77, -0.77, 0.64), Position) * 2.11 - 4.71;
+    amplitude *= 0.50;
+    value += amplitude * StormTransportValueNoise2D(Position);
+    return saturate(value);
+}
+
+struct FStormAnimationWeatherSample
+{
+    float Macro;
+    float Detail;
+    float2 Warp;
+};
+
+FStormAnimationWeatherSample StormSampleAnimationWeather(
+    float2 BodyCoord,
+    float HLocal,
+    float Salt)
+{
+    float2 saltOffset = float2(Salt * 0.0137, -Salt * 0.0091);
+    float2 p = BodyCoord * float2(0.73, 0.61)
+        + float2(HLocal * 0.17, -HLocal * 0.13)
+        + saltOffset;
+
+    float n0 = StormTransportValueNoise2D(
+        p + float2(3.17, -5.29));
+    float n1 = StormTransportValueNoise2D(
+        p.yx * float2(-1.31, 1.47)
+            + float2(-7.11, 2.37)
+            + (n0 - 0.5) * float2(0.61, -0.43));
+    float2 firstWarp = float2(n1 - n0, n0 + n1 - 1.0);
+    float n2 = StormTransportValueNoise2D(
+        (p + firstWarp * 0.57) * 2.03
+            + float2(5.73, 1.19));
+    float n3 = StormTransportValueNoise2D(
+        float2(
+            dot(BodyCoord, float2(0.91, 0.37)),
+            HLocal * 2.17 + dot(BodyCoord, float2(-0.23, 0.31)))
+            * float2(1.17, 1.43)
+            + float2(-4.41, 6.63)
+            + firstWarp.yx * 0.49
+            + saltOffset * 0.37);
+
+    FStormAnimationWeatherSample result;
+    result.Macro = saturate(n0 * 0.62 + n1 * 0.38);
+    result.Detail = saturate(n2 * 0.58 + n3 * 0.42);
+    result.Warp = clamp(
+        float2(n1 - n0, n3 - n2),
+        float2(-0.5, -0.5),
+        float2(0.5, 0.5));
+    return result;
+}
+
+float StormTransportMacro(float2 BodyCoord, float HLocal, float Salt)
+{
+    float2 q = BodyCoord * 2.07
+        + float2(HLocal * 0.79, -HLocal * 1.13)
+        + float2(Salt * 0.071, -Salt * 0.053);
+    float first = StormTransportFBM2D(q);
+    float second = StormTransportFBM2D(
+        q.yx * float2(-1.83, 1.67) + float2(9.31, -13.47));
+    return saturate(first * 0.66 + second * 0.34);
+}
+
+float StormTransportLane(float2 BodyCoord, float HLocal)
+{
+    float macroA = StormTransportMacro(BodyCoord, HLocal, 19.7);
+    float macroB = StormTransportMacro(
+        BodyCoord * float2(0.73, 1.31) + float2(macroA - 0.5, 0.0),
+        HLocal,
+        53.9);
+    float ridgeA = 1.0 - abs(macroA * 2.0 - 1.0);
+    float ridgeB = 1.0 - abs(macroB * 2.0 - 1.0);
+
+    // A weak, noise-warped angular bias lets incomplete inflow bands emerge,
+    // but the FBM ridges own most of the field so no equal sectors or clean
+    // mathematical spiral can appear.
+    float angle = atan2(BodyCoord.y, BodyCoord.x);
+    float radius = length(BodyCoord);
+    float angularBias = 0.5 + 0.5 * sin(
+        angle * lerp(1.37, 2.91, macroB)
+        + radius * lerp(2.2, 6.4, macroA)
+        + (macroA - macroB) * 4.9);
+    float broken = StormTransportMacro(
+        BodyCoord * 1.91 + float2(macroB, -macroA),
+        HLocal,
+        91.1);
+    return saturate(
+        ridgeA * 0.34
+        + ridgeB * 0.26
+        + angularBias * broken * 0.18
+        + broken * 0.22);
+}
+
+FStormLifecycleSample StormDecodeLifecycle(float EncodedControl)
+{
+    FStormLifecycleSample result;
+    if (EncodedControl >= 2.999)
+    {
+        result.Mode = 3u;
+        result.Progress = 1.0;
+    }
+    else if (EncodedControl >= 1.5)
+    {
+        result.Mode = 2u;
+        result.Progress = saturate(EncodedControl - 2.0);
+    }
+    else if (EncodedControl < 0.999)
+    {
+        result.Mode = 0u;
+        result.Progress = saturate(EncodedControl);
+    }
+    else
+    {
+        result.Mode = 1u;
+        result.Progress = 1.0;
+    }
+    return result;
+}
+
+FStormDomainSample StormDecodeTransportDomain(
+    float PackedStencil,
+    float Coverage,
+    float3 LFUVW)
+{
+    FStormDomainSample result;
+    result.MatureColumn = PackedStencil > 1.0 ? 1.0 : 0.0;
+    result.MatureStencil = result.MatureColumn > 0.5
+        ? saturate(PackedStencil - 1.0)
+        : 0.0;
+    float packedFeeder = saturate(PackedStencil);
+    result.FeederActive = result.MatureColumn > 0.5
+        ? 1.0
+        : step(0.50, packedFeeder);
+    result.FeederSupport = result.MatureColumn > 0.5
+        ? 1.0
+        : (result.FeederActive > 0.5
+            ? saturate((packedFeeder - 0.55) / 0.45)
+            : saturate(packedFeeder / 0.45));
+
+    // The binder writes a zero StormReferenceCenter, so LFUVW.xy is truly
+    // storm-local and gives a continuous direction field around the actor.
+    result.Radial = StormTransportSafeDirection(LFUVW.xy);
+    result.Tangent = float2(-result.Radial.y, result.Radial.x);
+
+    // Reconstruct an approximate authored radius from Coverage. BottomType is
+    // deliberately not consumed here: it is exclusively the Bottom LUT
+    // coordinate and cannot drive transport, masking, or erosion.
+    float coverageCoordinate = saturate((Coverage - 0.30) / 0.50);
+    float inwardCoordinate = pow(coverageCoordinate, 1.0 / 0.65);
+    float matureRadius = saturate(1.0 - inwardCoordinate);
+    float feederDistance = pow(
+        saturate(1.0 - result.FeederSupport),
+        1.35);
+    float feederRadius = 1.0 + feederDistance * 0.68;
+    result.Radius01 = lerp(feederRadius, matureRadius, result.MatureColumn);
+    result.BodyCoord = result.Radial * result.Radius01;
+    return result;
+}
+
+float StormNoiseUnitsPerBodyRadius(float3 NoiseUVW, float2 BodyCoord, float MinimumScale)
+{
+    float bodyRadius = max(length(BodyCoord), 0.16);
+    return max(length(NoiseUVW.xy) / bodyRadius, MinimumScale);
+}
+
+void StormSampleNubisNoiseUVW(
+    Texture3D LFNoiseTex,
+    SamplerState LFNoiseSampler,
+    Texture3D HFNoiseTex,
+    SamplerState HFNoiseSampler,
+    Texture2D CurlNoiseTex,
+    SamplerState CurlNoiseSampler,
+    float3 LFUVW,
+    float3 HFUVW,
+    float2 CurlUVW,
+    float CurlTiling,
+    float CurlDisplacementUVW,
+    float HLocal,
+    out float OutLFShape,
+    out float OutHFModifier)
+{
+    float4 lfRaw = Texture3DSampleLevel(
+        LFNoiseTex, LFNoiseSampler, frac(LFUVW), 0);
+    OutLFShape = StormDecodeNubisLFShape(lfRaw);
+
+    // The 2D asset is a signed vector field. It only warps the HF sampling
+    // coordinates; it never creates a second erosion branch or threshold.
+    float2 curlUV = frac(
+        CurlUVW * max(abs(CurlTiling), 1.0e-3));
+    float2 curlVector = Texture2DSampleLevel(
+        CurlNoiseTex, CurlNoiseSampler, curlUV, 0).rg * 2.0 - 1.0;
+    float3 warpedHFUVW = HFUVW;
+    warpedHFUVW.xy += curlVector
+        * CurlDisplacementUVW
+        * (1.0 - saturate(HLocal));
+
+    float3 hfRaw = Texture3DSampleLevel(
+        HFNoiseTex, HFNoiseSampler, frac(warpedHFUVW), 0).rgb;
+    OutHFModifier = StormEvaluateHeightDependentHFModifier(
+        StormDecodeNubisHFFBM(hfRaw),
+        HLocal);
+}
+
+void StormSampleNubisNoiseUVWPhased(
+    Texture3D LFNoiseTex,
+    SamplerState LFNoiseSampler,
+    Texture3D HFNoiseTex,
+    SamplerState HFNoiseSampler,
+    Texture2D CurlNoiseTex,
+    SamplerState CurlNoiseSampler,
+    float3 LFUVW,
+    float3 HFUVW,
+    float3 FlowOffsetA,
+    float3 FlowOffsetB,
+    float PhaseAWeight,
+    float2 CurlUVW,
+    float CurlTiling,
+    float CurlDisplacementUVW,
+    float HLocal,
+    out float OutLFShape,
+    out float OutHFModifier)
+{
+    float3 LFUVWPhaseA = LFUVW - FlowOffsetA;
+    float3 LFUVWPhaseB = LFUVW - FlowOffsetB;
+    float3 HFUVWPhaseA = HFUVW - FlowOffsetA;
+    float3 HFUVWPhaseB = HFUVW - FlowOffsetB;
+    float phaseAWeight = saturate(PhaseAWeight);
+
+    float lfShapeA;
+    float hfModifierA;
+    StormSampleNubisNoiseUVW(
+        LFNoiseTex,
+        LFNoiseSampler,
+        HFNoiseTex,
+        HFNoiseSampler,
+        CurlNoiseTex,
+        CurlNoiseSampler,
+        LFUVWPhaseA,
+        HFUVWPhaseA,
+        CurlUVW,
+        CurlTiling,
+        CurlDisplacementUVW,
+        HLocal,
+        lfShapeA,
+        hfModifierA);
+
+    float lfShapeB;
+    float hfModifierB;
+    StormSampleNubisNoiseUVW(
+        LFNoiseTex,
+        LFNoiseSampler,
+        HFNoiseTex,
+        HFNoiseSampler,
+        CurlNoiseTex,
+        CurlNoiseSampler,
+        LFUVWPhaseB,
+        HFUVWPhaseB,
+        CurlUVW,
+        CurlTiling,
+        CurlDisplacementUVW,
+        HLocal,
+        lfShapeB,
+        hfModifierB);
+
+    OutLFShape = lerp(lfShapeB, lfShapeA, phaseAWeight);
+    OutHFModifier = lerp(hfModifierB, hfModifierA, phaseAWeight);
+}
+
+float StormMDRLifecycleStrength(FStormLifecycleSample Lifecycle)
+{
+    if (Lifecycle.Mode == 0u)
+    {
+        return smoothstep(0.15, 0.65, Lifecycle.Progress);
+    }
+    if (Lifecycle.Mode == 1u)
+    {
+        return 1.0;
+    }
+    if (Lifecycle.Mode == 2u)
+    {
+        return 1.0 - smoothstep(0.65, 1.0, Lifecycle.Progress);
+    }
+    return 0.0;
+}
+
+void StormSampleNubisNoiseMDR(
+    Texture3D LFNoiseTex,
+    SamplerState LFNoiseSampler,
+    Texture3D HFNoiseTex,
+    SamplerState HFNoiseSampler,
+    Texture2D CurlNoiseTex,
+    SamplerState CurlNoiseSampler,
+    float3 LFUVW,
+    float3 HFUVW,
+    float2 CurlUVW,
+    float CurlTiling,
+    float CurlDisplacementUVW,
+    float HLocal,
+    float2 MDRBodyCoord,
+    FStormDomainSample Domain,
+    FStormLifecycleSample Lifecycle,
+    FStormMDRParameters MDR,
+    out float OutLFShape,
+    out float OutHFModifier)
+{
+    const float lifecycleStrength = StormMDRLifecycleStrength(Lifecycle);
+    const FStormMDRSampleState state = StormMDRBuildSampleState(
+        MDRBodyCoord,
+        HLocal,
+        lifecycleStrength,
+        MDR);
+
+    // A zero motion mask must be bit-for-bit equivalent to the original density
+    // path. This also prevents unnecessary extra texture samples outside the
+    // active motion region.
+    if (state.MotionMask <= 1.0e-4)
+    {
+        StormSampleNubisNoiseUVW(
+            LFNoiseTex,
+            LFNoiseSampler,
+            HFNoiseTex,
+            HFNoiseSampler,
+            CurlNoiseTex,
+            CurlNoiseSampler,
+            LFUVW,
+            HFUVW,
+            CurlUVW,
+            CurlTiling,
+            CurlDisplacementUVW,
+            HLocal,
+            OutLFShape,
+            OutHFModifier);
+        return;
+    }
+
+    const float lfMultiplier = StormMDRGetLFMultiplier(MDR);
+    const float hfMultiplier = StormMDRGetHFMultiplier(MDR);
+    const float curlMultiplier = StormMDRGetCurlMultiplier(MDR);
+    const bool useResultBlend =
+        StormMDRGetTransitionMode(MDR) == STORM_MDR_TRANSITION_RESULT_BLEND
+        && state.RingA != state.RingB
+        && state.RingBlend > 0.0
+        && state.RingBlend < 1.0;
+
+    float rotatedLFShape;
+    float rotatedHFModifier;
+
+    if (useResultBlend)
+    {
+        const float lfAngleA = StormMDRRingASampleAngle(state, lfMultiplier);
+        const float lfAngleB = StormMDRRingBSampleAngle(state, lfMultiplier);
+        const float hfAngleA = StormMDRRingASampleAngle(state, hfMultiplier);
+        const float hfAngleB = StormMDRRingBSampleAngle(state, hfMultiplier);
+        const float curlAngleA = StormMDRRingASampleAngle(state, curlMultiplier);
+        const float curlAngleB = StormMDRRingBSampleAngle(state, curlMultiplier);
+
+        float3 lfA = LFUVW;
+        float3 lfB = LFUVW;
+        float3 hfA = HFUVW;
+        float3 hfB = HFUVW;
+        float2 curlA = CurlUVW;
+        float2 curlB = CurlUVW;
+        lfA.xy = StormMDRRotate2D(lfA.xy, lfAngleA);
+        lfB.xy = StormMDRRotate2D(lfB.xy, lfAngleB);
+        hfA.xy = StormMDRRotate2D(hfA.xy, hfAngleA);
+        hfB.xy = StormMDRRotate2D(hfB.xy, hfAngleB);
+        curlA = StormMDRRotate2D(curlA, curlAngleA);
+        curlB = StormMDRRotate2D(curlB, curlAngleB);
+
+        float lfShapeA;
+        float hfModifierA;
+        float lfShapeB;
+        float hfModifierB;
+        StormSampleNubisNoiseUVW(
+            LFNoiseTex,
+            LFNoiseSampler,
+            HFNoiseTex,
+            HFNoiseSampler,
+            CurlNoiseTex,
+            CurlNoiseSampler,
+            lfA,
+            hfA,
+            curlA,
+            CurlTiling,
+            CurlDisplacementUVW,
+            HLocal,
+            lfShapeA,
+            hfModifierA);
+        StormSampleNubisNoiseUVW(
+            LFNoiseTex,
+            LFNoiseSampler,
+            HFNoiseTex,
+            HFNoiseSampler,
+            CurlNoiseTex,
+            CurlNoiseSampler,
+            lfB,
+            hfB,
+            curlB,
+            CurlTiling,
+            CurlDisplacementUVW,
+            HLocal,
+            lfShapeB,
+            hfModifierB);
+
+        rotatedLFShape = lerp(lfShapeA, lfShapeB, state.RingBlend);
+        rotatedHFModifier = lerp(hfModifierA, hfModifierB, state.RingBlend);
+    }
+    else
+    {
+        const float lfAngle = StormMDRSpeedBlendSampleAngle(state, lfMultiplier);
+        const float hfAngle = StormMDRSpeedBlendSampleAngle(state, hfMultiplier);
+        const float curlAngle = StormMDRSpeedBlendSampleAngle(state, curlMultiplier);
+        float3 rotatedLF = LFUVW;
+        float3 rotatedHF = HFUVW;
+        float2 rotatedCurl = CurlUVW;
+        rotatedLF.xy = StormMDRRotate2D(rotatedLF.xy, lfAngle);
+        rotatedHF.xy = StormMDRRotate2D(rotatedHF.xy, hfAngle);
+        rotatedCurl = StormMDRRotate2D(rotatedCurl, curlAngle);
+
+        StormSampleNubisNoiseUVW(
+            LFNoiseTex,
+            LFNoiseSampler,
+            HFNoiseTex,
+            HFNoiseSampler,
+            CurlNoiseTex,
+            CurlNoiseSampler,
+            rotatedLF,
+            rotatedHF,
+            rotatedCurl,
+            CurlTiling,
+            CurlDisplacementUVW,
+            HLocal,
+            rotatedLFShape,
+            rotatedHFModifier);
+    }
+
+    if (state.MotionMask >= 0.9999)
+    {
+        OutLFShape = rotatedLFShape;
+        OutHFModifier = rotatedHFModifier;
+        return;
+    }
+
+    // Apply the spatial/lifecycle mask to sample results, not to the phase.
+    // This keeps phase wrapping continuous and makes the feather a stable blend
+    // between the original and rotated density fields.
+    float staticLFShape;
+    float staticHFModifier;
+    StormSampleNubisNoiseUVW(
+        LFNoiseTex,
+        LFNoiseSampler,
+        HFNoiseTex,
+        HFNoiseSampler,
+        CurlNoiseTex,
+        CurlNoiseSampler,
+        LFUVW,
+        HFUVW,
+        CurlUVW,
+        CurlTiling,
+        CurlDisplacementUVW,
+        HLocal,
+        staticLFShape,
+        staticHFModifier);
+
+    OutLFShape = lerp(staticLFShape, rotatedLFShape, state.MotionMask);
+    OutHFModifier = lerp(staticHFModifier, rotatedHFModifier, state.MotionMask);
+}
+
+void StormEvaluateNubisDensityFromSamples(
+    float LFShape,
+    float HFModifier,
+    float VerticalProfile,
+    float Coverage,
+    float HeightInside,
+    float StormStencil,
+    float HFStrength,
+    out float OutCoarseDensity,
+    out float OutFineDensity)
+{
+    float coarseCoveredCloud = StormEvaluateCoveredBaseCloud(
+        LFShape,
+        VerticalProfile,
+        Coverage);
+    OutCoarseDensity = StormApplyDensityMasks(
+        coarseCoveredCloud,
+        HeightInside,
+        StormStencil);
+
+    // Erode the LF carrier first, then apply the shared Bottom*Top profile and
+    // Coverage. This keeps HF in the LF stage instead of eroding the already
+    // covered underside a second time.
+    float fineCarrier = StormApplyHFErosion(
+        LFShape,
+        HFModifier,
+        HFStrength);
+    float fineCoveredCloud = StormEvaluateCoveredBaseCloud(
+        fineCarrier,
+        VerticalProfile,
+        Coverage);
+    OutFineDensity = StormApplyDensityMasks(
+        fineCoveredCloud,
+        HeightInside,
+        StormStencil);
+}
+
+// Cyclonic handedness of the assembly animation. Flip to -1.0 if the spin-up
+// fights the mature storm's RotationSign on screen.
+static const float FormationSwirlSign = 1.0;
+
+float2 StormFormationFieldWarp(float2 BodyCoord, float HLocal, float Salt)
+{
+    // Low-cost continuous wave turbulence for the transport field. The
+    // incommensurate directions and nested phase warps avoid cells, sectors,
+    // periodic spokes, and expensive FBM evaluation inside the integration.
+    float2 q = BodyCoord * float2(1.13, 0.91)
+        + float2(HLocal * 0.23, -HLocal * 0.31);
+    float phaseA = dot(q, float2(1.71, -2.09))
+        + Salt * 0.113;
+    float phaseB = dot(q, float2(-2.83, 1.27))
+        - HLocal * 1.37
+        + Salt * 0.071;
+    float phaseC = dot(q, float2(4.11, 3.37))
+        + sin(phaseA) * 0.83
+        - cos(phaseB) * 0.61
+        + Salt * 0.037;
+    float2 field = float2(
+        sin(phaseA) * 0.52
+            + sin(phaseB * 0.73 + cos(phaseC)) * 0.31
+            + cos(phaseC) * 0.17,
+        cos(phaseB) * 0.49
+            + sin(phaseC * 0.67 + sin(phaseA)) * 0.34
+            - sin(phaseA * 0.47) * 0.17);
+    return clamp(field * 0.5, -0.5, 0.5);
+}
+
+float2 StormFormationBackwardDirection(
+    float2 BodyCoord,
+    float HLocal,
+    float StreamSalt,
+    out float OutChannel,
+    out float OutUpdraft)
+{
+    float radius = length(BodyCoord);
+    float2 originRadial = StormTransportSafeDirection(BodyCoord);
+    float2 fieldWarp = StormFormationFieldWarp(
+        BodyCoord,
+        HLocal,
+        StreamSalt);
+    float2 slowWarp = StormFormationFieldWarp(
+        BodyCoord * 0.59 + fieldWarp * 0.17,
+        HLocal * 0.71,
+        StreamSalt + 81.4);
+
+    // Convergence is toward a continuously wandering basin, never toward one
+    // exact common point. The backward field therefore produces curved,
+    // incomplete inflow corridors instead of a radial fan.
+    float2 wanderingCenter = slowWarp
+        * lerp(0.18, 0.34, saturate(radius));
+    float2 basinRadial = StormTransportSafeDirection(
+        BodyCoord - wanderingCenter);
+    float2 basinTangent = float2(-basinRadial.y, basinRadial.x);
+
+    float channelA = 0.5 + 0.5 * sin(
+        dot(BodyCoord + fieldWarp * 0.31, float2(2.17, -1.43))
+        + HLocal * 1.19
+        + StreamSalt * 0.047);
+    float channelB = 0.5 + 0.5 * sin(
+        dot(BodyCoord.yx + slowWarp * 0.27, float2(-3.31, 2.53))
+        - HLocal * 0.83
+        + StreamSalt * 0.029
+        + channelA * 1.71);
+    float channelRidge = 1.0 - abs(channelA * 2.0 - 1.0);
+    OutChannel = saturate(
+        channelA * 0.43
+        + channelB * 0.34
+        + channelRidge * 0.23);
+    OutUpdraft = saturate(
+        StormTransportSmoother01(
+            (OutChannel - 0.28) / 0.72)
+        * lerp(0.61, 1.0, channelB));
+
+    float meander = dot(fieldWarp, basinTangent) * 1.36
+        + (channelB - 0.5) * 0.63;
+    // A consistent tangential bias makes the inflow spiral instead of
+    // converging straight; it strengthens toward the centre like a cyclone.
+    float swirlBias = FormationSwirlSign
+        * lerp(0.85, 0.32, saturate(radius));
+    float2 crossDrift = (fieldWarp + slowWarp * 0.61)
+        * lerp(0.19, 0.39, saturate(radius));
+    float2 direction = StormTransportSafeDirection(
+        basinRadial
+        + basinTangent * (meander - swirlBias)
+        + crossDrift);
+
+    // Net convergence strengthens toward the centre so inflow reads as suction,
+    // while distant streams keep meandering, splitting, and bending.
+    float radialFloor = lerp(0.30, 0.12, saturate(radius));
+    float outwardDot = dot(direction, originRadial);
+    direction = StormTransportSafeDirection(
+        direction
+        + originRadial * max(radialFloor - outwardDot, 0.0) * 2.1);
+    return direction;
+}
+
+void StormBuildFormationTransport(
+    FStormDomainSample Domain,
+    float HLocal,
+    float HeightInside,
+    float GlobalProgress,
+    float3 LFUVW,
+    float3 HFUVW,
+    out float3 OutLFUVW,
+    out float3 OutHFUVW,
+    out float OutCondensation,
+    out float OutSourceMass,
+    out float OutSourceEnvelope,
+    out float OutSourceProfile,
+    out float OutBreakup,
+    out float OutSourceLifecycle)
+{
+    float swirlAngle = FormationSwirlSign
+        * (1.0 - GlobalProgress)
+        * 0.045;
+    float swirlSin;
+    float swirlCos;
+    sincos(swirlAngle, swirlSin, swirlCos);
+    Domain.BodyCoord = float2(
+        Domain.BodyCoord.x * swirlCos - Domain.BodyCoord.y * swirlSin,
+        Domain.BodyCoord.x * swirlSin + Domain.BodyCoord.y * swirlCos);
+    Domain.Radial = StormTransportSafeDirection(Domain.BodyCoord);
+    Domain.Tangent = float2(-Domain.Radial.y, Domain.Radial.x);
+
+    FStormAnimationWeatherSample weather = StormSampleAnimationWeather(
+        Domain.BodyCoord,
+        HLocal,
+        41.3);
+    float2 warpedBody = Domain.BodyCoord
+        + weather.Warp * 0.44
+        + Domain.Tangent * (weather.Detail - 0.5) * 0.19;
+
+    const float2 frontDirectionA = float2(0.842, -0.540);
+    const float2 frontDirectionB = float2(-0.218, 0.976);
+    const float2 frontDirectionC = float2(-0.947, -0.322);
+    float frontCoordinateA = dot(warpedBody, frontDirectionA)
+        + (weather.Macro - 0.5) * 0.58
+        - (weather.Detail - 0.5) * 0.19;
+    float frontCoordinateB = dot(warpedBody, frontDirectionB)
+        + (weather.Detail - 0.5) * 0.52
+        + weather.Warp.x * 0.31;
+    float frontCoordinateC = dot(warpedBody, frontDirectionC)
+        + (weather.Macro - weather.Detail) * 0.37
+        + weather.Warp.y * 0.28;
+    const float2 frontCrossA = float2(0.540, 0.842);
+    const float2 frontCrossB = float2(-0.976, -0.218);
+    const float2 frontCrossC = float2(0.322, -0.947);
+    float frontAcrossA = dot(warpedBody, frontCrossA)
+        + weather.Warp.y * 0.43
+        + (weather.Macro - 0.5) * 0.29;
+    float frontAcrossB = dot(warpedBody, frontCrossB)
+        + weather.Warp.x * 0.39
+        + (weather.Detail - 0.5) * 0.25;
+    float frontAcrossC = dot(warpedBody, frontCrossC)
+        + (weather.Macro - weather.Detail) * 0.31;
+
+    float inflowFrontA = smoothstep(-0.23, 1.18, frontCoordinateA)
+        * (1.0 - smoothstep(0.33, 0.86, abs(frontAcrossA)));
+    float inflowFrontB = smoothstep(-0.17, 1.24, frontCoordinateB)
+        * (1.0 - smoothstep(0.28, 0.75, abs(frontAcrossB)));
+    float inflowFrontC = smoothstep(-0.11, 1.29, frontCoordinateC)
+        * (1.0 - smoothstep(0.30, 0.80, abs(frontAcrossC)));
+    float broadExposure = saturate(max(
+        inflowFrontA * lerp(0.66, 1.0, weather.Macro),
+        max(
+            inflowFrontB * lerp(0.58, 0.94, weather.Detail),
+            inflowFrontC * lerp(0.43, 0.79, weather.Macro * weather.Detail))));
+    float basinAccess = saturate(
+        broadExposure * 0.55
+        + weather.Macro * 0.24
+        + weather.Detail * 0.15
+        + max(abs(weather.Warp.x), abs(weather.Warp.y)) * 0.12);
+    float lowBias = 1.0 - smoothstep(
+        0.14 + (weather.Detail - 0.5) * 0.08,
+        0.62 + (weather.Macro - 0.5) * 0.12,
+        HLocal);
+    float skewFrontA = 0.5 + 0.5 * sin(
+        dot(warpedBody, float2(1.37, -0.83)) * 2.11
+        + weather.Macro * 2.73
+        - weather.Detail * 1.41);
+    float skewFrontB = 0.5 + 0.5 * sin(
+        dot(warpedBody, float2(-0.61, 1.29)) * 1.67
+        + weather.Detail * 3.17
+        + weather.Macro * 0.91);
+    float brokenFront = saturate(
+        skewFrontA * 0.46
+        + skewFrontB * 0.29
+        + weather.Macro * 0.25);
+    float pocketSignal = saturate(
+        weather.Macro * 0.41
+        + weather.Detail * 0.29
+        + brokenFront * 0.18
+        + broadExposure * 0.07
+        + lowBias * 0.05);
+    float pocket = smoothstep(0.44, 0.69, pocketSignal);
+
+    float startTime = saturate(
+        0.020
+        + (1.0 - pocket) * 0.21
+        + HLocal * lerp(0.13, 0.24, 1.0 - weather.Detail)
+        + (1.0 - broadExposure) * 0.055
+        + (skewFrontB - 0.5) * 0.075
+        + (weather.Detail - 0.5) * 0.065);
+    float duration = lerp(0.39, 0.61, weather.Macro);
+    duration = min(duration, 0.91 - startTime);
+    float localProgress = StormTransportSmoother01(
+        (GlobalProgress - startTime) / max(duration, 0.09));
+    float arrival = pow(localProgress, 1.38);
+
+    float captureGate = smoothstep(
+        0.19 + (weather.Macro - 0.5) * 0.06,
+        0.70 + (weather.Detail - 0.5) * 0.09,
+        basinAccess);
+    float transportAccess = saturate(
+        captureGate * 0.58
+        + broadExposure * 0.34
+        + brokenFront * 0.08);
+    float travelDistance = lerp(0.23, 0.48, weather.Macro)
+        * (1.0 - arrival)
+        * lerp(0.58, 1.0, transportAccess);
+
+    float channel0;
+    float updraft0;
+    float2 backwardDirection0 = StormFormationBackwardDirection(
+        Domain.BodyCoord,
+        HLocal,
+        271.1,
+        channel0,
+        updraft0);
+
+    float radialComponent0 = dot(backwardDirection0, Domain.Radial);
+    float2 tangentialComponent0 = backwardDirection0
+        - Domain.Radial * radialComponent0;
+    float inwardFloor0 = lerp(0.24, 0.42, captureGate);
+    float2 visibleDirection0 = StormTransportSafeDirection(
+        tangentialComponent0
+        - Domain.Radial * max(abs(radialComponent0), inwardFloor0));
+
+    float2 midpointBody = Domain.BodyCoord
+        + visibleDirection0 * travelDistance * 0.52;
+    float2 midpointRadial = StormTransportSafeDirection(midpointBody);
+    float channel1;
+    float updraft1;
+    float2 backwardDirection1 = StormFormationBackwardDirection(
+        midpointBody,
+        HLocal,
+        337.7,
+        channel1,
+        updraft1);
+    float radialComponent1 = dot(backwardDirection1, midpointRadial);
+    float2 tangentialComponent1 = backwardDirection1
+        - midpointRadial * radialComponent1;
+    float inwardFloor1 = lerp(0.22, 0.40, captureGate);
+    float2 visibleDirection1 = StormTransportSafeDirection(
+        tangentialComponent1
+        - midpointRadial * max(abs(radialComponent1), inwardFloor1));
+
+    float2 curvedCandidate = visibleDirection0 * 0.34
+        + visibleDirection1 * 0.66
+        + frontDirectionA * inflowFrontA * 0.13
+        + frontDirectionB * inflowFrontB * 0.10
+        + frontDirectionC * inflowFrontC * 0.08;
+    float candidateRadial = dot(curvedCandidate, Domain.Radial);
+    float2 candidateTangent = curvedCandidate
+        - Domain.Radial * candidateRadial;
+    float2 curvedDirection = StormTransportSafeDirection(
+        candidateTangent
+        - Domain.Radial * max(abs(candidateRadial), 0.20));
+    float flowChannel = saturate(channel0 * 0.38 + channel1 * 0.62);
+    float flowUpdraft = saturate(updraft0 * 0.38 + updraft1 * 0.62);
+    float2 sourceBody = Domain.BodyCoord
+        + curvedDirection * travelDistance;
+
+    float2 spinOffset = sourceBody - Domain.BodyCoord;
+    float2 bodyOffset = float2(
+        spinOffset.x * swirlCos + spinOffset.y * swirlSin,
+        -spinOffset.x * swirlSin + spinOffset.y * swirlCos);
+    float lfUnits = StormNoiseUnitsPerBodyRadius(
+        LFUVW, Domain.BodyCoord, 0.006);
+    float hfUnits = StormNoiseUnitsPerBodyRadius(
+        HFUVW, Domain.BodyCoord, 0.018);
+    OutLFUVW = LFUVW;
+    OutHFUVW = HFUVW;
+    OutLFUVW.xy += bodyOffset * lfUnits;
+    OutHFUVW.xy += bodyOffset * hfUnits;
+
+    float updraft = smoothstep(
+        0.40,
+        0.79,
+        weather.Detail * 0.35
+            + weather.Macro * 0.24
+            + flowUpdraft * 0.41);
+    float liftArc = arrival * (1.0 - arrival)
+        * captureGate
+        * lerp(0.10, 0.34, updraft);
+    OutLFUVW.z -= liftArc * lfUnits * 0.42;
+    OutHFUVW.z -= liftArc * hfUnits * 0.58;
+
+    FStormAnimationWeatherSample sourceWeather = StormSampleAnimationWeather(
+        sourceBody,
+        HLocal,
+        173.9);
+
+    float sourceVerticalPhase = 0.5 + 0.5 * sin(
+        dot(sourceBody, float2(1.43, -0.91)) * 3.17
+        + sourceWeather.Macro * 3.41
+        - sourceWeather.Detail * 2.23);
+    float sourceLobeCenter = saturate(
+        lerp(0.09, 0.39, localProgress)
+        + (sourceWeather.Macro - 0.5) * 0.18
+        + (sourceWeather.Detail - 0.5) * 0.16
+        + (sourceVerticalPhase - 0.5) * 0.15
+        + updraft * localProgress * 0.10);
+    float sourceVerticalFrequency = (1.0 - arrival)
+        * lerp(0.30, 0.52, sourceWeather.Detail)
+        * lerp(0.76, 1.0, captureGate);
+    float sourceVerticalOffset = (HLocal - sourceLobeCenter)
+        * sourceVerticalFrequency;
+    OutLFUVW.z += sourceVerticalOffset * lfUnits;
+    OutHFUVW.z += sourceVerticalOffset * hfUnits * 0.84;
+
+    float2 sourceWarped = sourceBody
+        + sourceWeather.Warp * 0.43
+        + float2(
+            (HLocal - 0.34) * (sourceWeather.Detail - 0.5) * 0.22,
+            (HLocal - 0.29) * (sourceWeather.Macro - 0.5) * 0.18);
+    float supportThreshold = lerp(
+        0.004,
+        0.022,
+        sourceWeather.Detail * 0.58 + sourceWeather.Macro * 0.42);
+    float farDomainGuard = Domain.MatureColumn > 0.5
+        ? 1.0
+        : StormTransportSmoother01(
+            (Domain.FeederSupport - supportThreshold) / 0.16);
+
+    float sourceAcrossA = dot(sourceWarped, frontCrossA)
+        + sourceWeather.Warp.y * 0.47
+        + (sourceWeather.Macro - 0.5) * 0.27;
+    float sourceAcrossB = dot(sourceWarped, frontCrossB)
+        + sourceWeather.Warp.x * 0.42
+        + (sourceWeather.Detail - 0.5) * 0.24;
+    float sourceAcrossC = dot(sourceWarped, frontCrossC)
+        + (sourceWeather.Macro - sourceWeather.Detail) * 0.29;
+    float sourceAlongA = dot(sourceWarped, frontDirectionA)
+        + (sourceWeather.Macro - 0.5) * 0.61;
+    float sourceAlongB = dot(sourceWarped, frontDirectionB)
+        + (sourceWeather.Detail - 0.5) * 0.57
+        + sourceWeather.Warp.x * 0.30;
+    float sourceAlongC = dot(sourceWarped, frontDirectionC)
+        + (sourceWeather.Macro - sourceWeather.Detail) * 0.41;
+    float sourceWindowA = smoothstep(-0.34, 0.12, sourceAlongA)
+        * (1.0 - smoothstep(
+            1.02 + (sourceWeather.Detail - 0.5) * 0.18,
+            1.72 + (sourceWeather.Macro - 0.5) * 0.25,
+            sourceAlongA));
+    float sourceWindowB = smoothstep(-0.29, 0.16, sourceAlongB)
+        * (1.0 - smoothstep(
+            0.97 + (sourceWeather.Macro - 0.5) * 0.16,
+            1.64 + (sourceWeather.Detail - 0.5) * 0.23,
+            sourceAlongB));
+    float sourceWindowC = smoothstep(-0.24, 0.20, sourceAlongC)
+        * (1.0 - smoothstep(
+            0.91 + (sourceWeather.Detail - 0.5) * 0.15,
+            1.57 + (sourceWeather.Macro - 0.5) * 0.21,
+            sourceAlongC));
+    float sourceInflowA = sourceWindowA
+        * (1.0 - smoothstep(0.35, 0.91, abs(sourceAcrossA)));
+    float sourceInflowB = sourceWindowB
+        * (1.0 - smoothstep(0.30, 0.79, abs(sourceAcrossB)));
+    float sourceInflowC = sourceWindowC
+        * (1.0 - smoothstep(0.32, 0.84, abs(sourceAcrossC)));
+    float sourceExposure = saturate(max(
+        sourceInflowA,
+        max(sourceInflowB * 0.88, sourceInflowC * 0.70)));
+    float sourceFrontA = 0.5 + 0.5 * sin(
+        dot(sourceWarped, float2(1.11, 0.47)) * 2.43
+        + sourceWeather.Macro * 2.19
+        - sourceWeather.Detail * 1.37);
+    float sourceFrontB = 0.5 + 0.5 * sin(
+        dot(sourceWarped, float2(-0.39, 1.33)) * 1.79
+        + sourceWeather.Detail * 2.81
+        + sourceWeather.Macro * 0.73);
+    float sourceSeedSignal = saturate(
+        sourceWeather.Macro * 0.38
+        + sourceWeather.Detail * 0.29
+        + sourceFrontA * 0.16
+        + sourceFrontB * 0.10
+        + sourceExposure * 0.07);
+    float sourceSeed = smoothstep(0.43, 0.70, sourceSeedSignal);
+    float sourceLowBias = 1.0 - smoothstep(
+        0.16 + (sourceWeather.Detail - 0.5) * 0.09,
+        0.58 + (sourceWeather.Macro - 0.5) * 0.13,
+        HLocal);
+    float sourceHumiditySignal = saturate(
+        sourceWeather.Macro * 0.38
+        + sourceWeather.Detail * 0.30
+        + (sourceWeather.Warp.x + 0.5) * 0.18
+        + (sourceWeather.Warp.y + 0.5) * 0.14
+        + sourceLowBias * 0.03);
+    float sourceHumidity = smoothstep(0.28, 0.76, sourceHumiditySignal);
+    float outerStreamBias = smoothstep(
+        0.70,
+        1.16,
+        length(sourceWarped));
+    float sourceExposureWeighted = saturate(
+        sourceExposure * lerp(0.72, 1.14, outerStreamBias));
+    float streamAccessSignal = saturate(
+        sourceExposureWeighted * 0.58
+        + sourceSeed * 0.18
+        + sourceHumidity * 0.12
+        + flowChannel * 0.12);
+    float streamAccess = smoothstep(0.16, 0.72, streamAccessSignal);
+    float porousAccess = saturate(
+        streamAccess * 0.78
+        + sourceSeed * sourceHumidity * 0.22);
+
+    float pocketBirth = StormTransportSmoother01(
+        (localProgress - (1.0 - sourceSeed) * 0.24) / 0.39);
+    float inwardRelease = StormTransportSmoother01(
+        (localProgress - lerp(0.22, 0.07, sourceExposure)) / 0.58);
+    float upwardRelease = StormTransportSmoother01(
+        (localProgress - HLocal * lerp(0.23, 0.43, 1.0 - updraft)) / 0.65);
+    float originSequence = saturate(max(
+        sourceSeed * sourceLowBias * pocketBirth
+            * lerp(0.72, 1.10, outerStreamBias),
+        inwardRelease * upwardRelease * lerp(0.72, 0.94, sourceSeed))
+        * lerp(0.34, 1.0, porousAccess));
+
+    float handoff = 1.0 - StormTransportSmoother01(
+        (arrival - 0.72) / 0.28);
+    float birth = StormTransportSmoother01(
+        (GlobalProgress
+            - startTime * 0.52
+            - (1.0 - sourceHumidity) * 0.065) / 0.24);
+    float startGate = StormTransportSmoother01(GlobalProgress / 0.032);
+    OutSourceLifecycle = saturate(
+        startGate * birth * handoff * originSequence
+        * lerp(0.28, 1.0, porousAccess));
+
+    float humidityWeight = lerp(0.48, 1.0, sourceHumidity);
+    float captureAccess = lerp(
+        captureGate,
+        smoothstep(0.62, 0.83,
+            updraft * 0.73 + sourceWeather.Detail * 0.27) * 0.48,
+        1.0 - captureGate);
+    OutSourceEnvelope = saturate(
+        farDomainGuard * lerp(0.22, 1.0, porousAccess));
+    OutSourceMass = saturate(
+        humidityWeight
+        * lerp(0.48, 1.0, captureAccess)
+        * lerp(0.18, 1.0, porousAccess)
+        * lerp(0.82, 1.0, flowChannel));
+
+    float sourceHalfThickness = saturate(
+        lerp(0.060, 0.165, localProgress)
+        + updraft * localProgress * 0.038
+        + (sourceWeather.Macro - 0.5) * 0.030
+        + (sourceVerticalPhase - 0.5) * 0.025);
+    float lowerFeather = lerp(0.055, 0.105, sourceWeather.Detail);
+    float upperFeather = lerp(0.075, 0.135, sourceWeather.Macro);
+    float sourceBottomEdge = sourceLobeCenter - sourceHalfThickness;
+    float sourceTopEdge = sourceLobeCenter + sourceHalfThickness;
+    float sourceBottom = smoothstep(
+        sourceBottomEdge - lowerFeather,
+        sourceBottomEdge + lowerFeather,
+        HLocal);
+    float sourceTop = 1.0 - smoothstep(
+        sourceTopEdge - upperFeather,
+        sourceTopEdge + upperFeather,
+        HLocal);
+    float primarySourceProfile = sourceBottom * sourceTop;
+
+    float upperLobeCenter = saturate(
+        sourceLobeCenter
+        + lerp(0.13, 0.27, sourceWeather.Detail)
+        + (sourceVerticalPhase - 0.5) * 0.08);
+    float upperLobeHalfThickness = lerp(
+        0.045,
+        0.105,
+        sourceWeather.Macro);
+    float upperLobeBottom = smoothstep(
+        upperLobeCenter - upperLobeHalfThickness - 0.055,
+        upperLobeCenter - upperLobeHalfThickness + 0.055,
+        HLocal);
+    float upperLobeTop = 1.0 - smoothstep(
+        upperLobeCenter + upperLobeHalfThickness - 0.085,
+        upperLobeCenter + upperLobeHalfThickness + 0.085,
+        HLocal);
+    float upperLobeWeight = StormTransportSmoother01(
+        (localProgress - 0.24) / 0.52)
+        * lerp(0.38, 0.72, updraft);
+    OutSourceProfile = saturate(max(
+        primarySourceProfile,
+        upperLobeBottom * upperLobeTop * upperLobeWeight)
+        * HeightInside);
+
+    float destinationLow = 1.0 - smoothstep(
+        0.18 + (weather.Macro - 0.5) * 0.08,
+        0.64 + (weather.Detail - 0.5) * 0.10,
+        HLocal);
+    float frontRidgeA = 1.0 - abs(skewFrontA * 2.0 - 1.0);
+    float frontRidgeB = 1.0 - abs(skewFrontB * 2.0 - 1.0);
+    float destinationFrontSignal = saturate(
+        pocket * 0.32
+        + brokenFront * 0.24
+        + weather.Macro * 0.16
+        + weather.Detail * 0.12
+        + frontRidgeA * 0.09
+        + frontRidgeB * 0.07);
+    float destinationFront = smoothstep(0.39, 0.70, destinationFrontSignal);
+    float branchAccess = saturate(
+        destinationFront * 0.76
+        + destinationLow * 0.17
+        + basinAccess * 0.07);
+    float verticalCost = pow(saturate(HLocal), lerp(0.82, 1.54, weather.Macro))
+        * lerp(0.11, 0.26, 1.0 - updraft);
+    float branchDelay = (1.0 - branchAccess)
+        * lerp(0.07, 0.19, 1.0 - sourceWeather.Detail);
+    float frontJitter = (skewFrontA - 0.5) * 0.075
+        + (skewFrontB - 0.5) * 0.055;
+    float basinArrival = max(
+        startTime
+        + verticalCost
+        + branchDelay
+        + frontJitter
+        - destinationFront * destinationLow * 0.070
+        + (weather.Detail - 0.5) * 0.13
+        + (sourceWeather.Macro - 0.5) * 0.07
+        - captureGate * updraft * 0.10,
+        0.0) * 0.52 + 0.055;
+    basinArrival = min(basinArrival, 0.74);
+    float basinDuration = lerp(0.14, 0.22, weather.Macro);
+    OutCondensation = saturate(
+        StormTransportSmoother01(
+            (GlobalProgress - basinArrival) / basinDuration)
+        * Domain.MatureColumn);
+
+    OutBreakup = smoothstep(
+        0.31,
+        0.76,
+        sourceWeather.Detail * 0.52
+            + weather.Macro * 0.24
+            + updraft * 0.24);
+}
+
+void StormBuildDissolutionTransport(
+    FStormDomainSample Domain,
+    float HLocal,
+    float GlobalProgress,
+    float3 LFUVW,
+    float3 HFUVW,
+    out float3 OutLFUVW,
+    out float3 OutHFUVW,
+    out float OutSurvival)
+{
+    FStormAnimationWeatherSample weather = StormSampleAnimationWeather(
+        Domain.BodyCoord,
+        HLocal,
+        367.3);
+    float exposed = saturate(
+        Domain.Radius01 * 0.43
+        + HLocal * 0.37
+        + weather.Detail * 0.20);
+    float startTime = saturate(
+        0.028
+        + (1.0 - exposed) * 0.21
+        + (weather.Macro - 0.5) * 0.09);
+    float localBreak = StormTransportSmoother01(
+        (GlobalProgress - startTime)
+        / lerp(0.44, 0.64, weather.Detail));
+
+    float2 prevailingShear = StormTransportSafeDirection(
+        float2(0.78, 0.46) + weather.Warp * 0.73);
+    float radialEscape = lerp(0.16, 0.47, weather.Macro)
+        * StormTransportSmoother01((Domain.Radius01 - 0.06) / 0.94);
+    float tangentialRemnant = (weather.Detail - 0.5) * 0.71;
+    float2 shearDirection = StormTransportSafeDirection(
+        prevailingShear
+        + Domain.Radial * radialEscape
+        + Domain.Tangent * tangentialRemnant);
+
+    float2 bodyOffset = -shearDirection
+        * localBreak
+        * lerp(0.11, 0.52, weather.Detail)
+        * lerp(0.43, 1.0, HLocal);
+    bodyOffset += Domain.Tangent
+        * (weather.Macro - 0.5)
+        * localBreak
+        * 0.16;
+
+    float lfUnits = StormNoiseUnitsPerBodyRadius(
+        LFUVW, Domain.BodyCoord, 0.006);
+    float hfUnits = StormNoiseUnitsPerBodyRadius(
+        HFUVW, Domain.BodyCoord, 0.018);
+    OutLFUVW = LFUVW;
+    OutHFUVW = HFUVW;
+    OutLFUVW.xy += bodyOffset * lfUnits;
+    OutHFUVW.xy += bodyOffset * hfUnits;
+    OutLFUVW.z += localBreak
+        * lerp(0.018, 0.17, HLocal)
+        * weather.Detail
+        * lfUnits;
+    OutHFUVW.z += localBreak
+        * lerp(0.045, 0.31, HLocal)
+        * weather.Detail
+        * hfUnits;
+
+    float supplyLoss = localBreak
+        * lerp(0.74, 1.14, HLocal)
+        * lerp(0.81, 1.17, Domain.Radius01)
+        * lerp(0.80, 1.18, weather.Macro);
+    float filament = smoothstep(
+        0.30,
+        0.80,
+        weather.Detail * 0.61 + weather.Macro * 0.39);
+    float terminalCollapse = 1.0 - StormTransportSmoother01(
+        (GlobalProgress - 0.75) / 0.23);
+    OutSurvival = saturate(
+        (1.0 - StormTransportSmoother01(supplyLoss))
+        * lerp(1.0, filament, localBreak * 0.55)
+        * terminalCollapse);
+}
+
+float StormEvaluateMaterialDensity(
+    Texture2D BottomProfileTex,
+    SamplerState BottomProfileSampler,
+    Texture2D TopProfileTex,
+    SamplerState TopProfileSampler,
+    Texture3D LFNoiseTex,
+    SamplerState LFNoiseSampler,
+    Texture3D HFNoiseTex,
+    SamplerState HFNoiseSampler,
+    Texture2D CurlNoiseTex,
+    SamplerState CurlNoiseSampler,
+    float Coverage,
+    float HLocal,
+    float HeightInside,
+    float BottomType,
+    float TopType,
+    float StormStencil,
+    float AnvilStrength,
+    float AnvilDepth,
+    float3 LFUVW,
+    float3 HFUVW,
+    float3 FlowOffsetA,
+    float3 FlowOffsetB,
+    float PhaseAWeight,
+    float2 CurlUVW,
+    float CurlTiling,
+    float CurlDisplacementUVW,
+    float LFMacroMax,
+    float BottomWispyStrength,
+    float BottomHFStrength,
+    float BottomCurlStrength,
+    float HFStrength,
+    float HFStrengthAnvil,
+    out float OutCoarseDensity)
+{
+    FStormLifecycleSample lifecycle = StormDecodeLifecycle(LFMacroMax);
+    if (lifecycle.Mode == 3u)
+    {
+        OutCoarseDensity = 0.0;
+        return 0.0;
+    }
+
+    float h = saturate(HLocal);
+    FStormDomainSample domain = StormDecodeTransportDomain(
+        StormStencil,
+        Coverage,
+        LFUVW);
+
+    float activeSupport = saturate(max(
+        domain.MatureColumn,
+        domain.FeederActive));
+    if (HeightInside <= 1.0e-5)
+    {
+        OutCoarseDensity = 0.0;
+        return 0.0;
+    }
+    if (lifecycle.Mode == 0u && activeSupport <= 1.0e-4)
+    {
+        OutCoarseDensity = 0.0;
+        return 0.0;
+    }
+    if (lifecycle.Mode != 0u && domain.MatureStencil <= 1.0e-5)
+    {
+        OutCoarseDensity = 0.0;
+        return 0.0;
+    }
+
+    float verticalProfile = 1.0;
+    if (domain.MatureColumn > 0.5)
+    {
+        float bottomProfile = StormEvaluateBottomTypeProfile(
+            BottomProfileTex,
+            BottomProfileSampler,
+            h,
+            BottomType);
+        float topProfile = StormEvaluateCloudTypeProfile(
+            TopProfileTex,
+            TopProfileSampler,
+            h,
+            TopType);
+        verticalProfile = StormEvaluateVerticalProfile(
+            bottomProfile,
+            topProfile);
+    }
+
+    // The mature endpoint is the direct 2015 Nubis order, with no lifecycle
+    // transport or additional BottomType-driven morphology or erosion.
+    if (lifecycle.Mode == 1u)
+    {
+        float lfShape;
+        float hfModifier;
+        StormSampleNubisNoiseUVWPhased(
+            LFNoiseTex,
+            LFNoiseSampler,
+            HFNoiseTex,
+            HFNoiseSampler,
+            CurlNoiseTex,
+            CurlNoiseSampler,
+            LFUVW,
+            HFUVW,
+            FlowOffsetA,
+            FlowOffsetB,
+            PhaseAWeight,
+            CurlUVW,
+            CurlTiling,
+            CurlDisplacementUVW,
+            h,
+            lfShape,
+            hfModifier);
+
+        float fineDensity;
+        StormEvaluateNubisDensityFromSamples(
+            lfShape,
+            hfModifier,
+            verticalProfile,
+            Coverage,
+            HeightInside,
+            domain.MatureStencil,
+            HFStrength,
+            OutCoarseDensity,
+            fineDensity);
+        return fineDensity;
+    }
+
+    if (lifecycle.Mode == 0u)
+    {
+        float formationTimelineProgress = lerp(
+            0.28,
+            1.0,
+            lifecycle.Progress);
+        float formationInitialFade = StormTransportSmoother01(
+            lifecycle.Progress / 0.045);
+
+        float3 transportedLF;
+        float3 transportedHF;
+        float condensation;
+        float sourceMass;
+        float sourceEnvelope;
+        float sourceProfile;
+        float breakup;
+        float sourceLifecycle;
+        StormBuildFormationTransport(
+            domain,
+            h,
+            HeightInside,
+            formationTimelineProgress,
+            LFUVW,
+            HFUVW,
+            transportedLF,
+            transportedHF,
+            condensation,
+            sourceMass,
+            sourceEnvelope,
+            sourceProfile,
+            breakup,
+            sourceLifecycle);
+
+        float lfShape;
+        float hfModifier;
+        StormSampleNubisNoiseUVWPhased(
+            LFNoiseTex,
+            LFNoiseSampler,
+            HFNoiseTex,
+            HFNoiseSampler,
+            CurlNoiseTex,
+            CurlNoiseSampler,
+            transportedLF,
+            transportedHF,
+            FlowOffsetA,
+            FlowOffsetB,
+            PhaseAWeight,
+            CurlUVW,
+            CurlTiling,
+            CurlDisplacementUVW,
+            h,
+            lfShape,
+            hfModifier);
+
+        float destinationCoarse;
+        float destinationFine;
+        StormEvaluateNubisDensityFromSamples(
+            lfShape,
+            hfModifier,
+            verticalProfile,
+            Coverage,
+            HeightInside,
+            domain.MatureStencil,
+            HFStrength,
+            destinationCoarse,
+            destinationFine);
+
+        float destinationEdgeCarrier = saturate(
+            lfShape - hfModifier * lerp(0.07, 0.13, 1.0 - h));
+
+        float destinationEnable = StormTransportSmoother01(
+            (formationTimelineProgress - 0.46) / 0.34);
+        float endpointDelay = saturate(
+            (1.0 - destinationEdgeCarrier) * 0.58
+            + (1.0 - domain.MatureStencil) * 0.17
+            + (1.0 - condensation) * 0.25);
+        float endpointCarrierLock = StormTransportSmoother01(
+            (formationTimelineProgress
+                - lerp(0.84, 0.975, endpointDelay))
+            / lerp(0.13, 0.024, endpointDelay));
+        endpointCarrierLock = max(
+            endpointCarrierLock,
+            step(0.9995, formationTimelineProgress));
+        float destinationReveal = condensation * destinationEnable;
+        float destinationClumpEdge = lerp(1.06, -0.18, destinationReveal);
+        float destinationClumpWidth = lerp(0.22, 0.14, destinationReveal);
+        float destinationClump = smoothstep(
+            destinationClumpEdge,
+            destinationClumpEdge + destinationClumpWidth,
+            destinationEdgeCarrier);
+        destinationClump = lerp(
+            destinationClump,
+            1.0,
+            endpointCarrierLock);
+        destinationCoarse *= destinationClump;
+        destinationFine *= destinationClump;
+
+        float sourceCoverage = lerp(0.41, 0.74, breakup);
+        float sourceCoarse;
+        float sourceFine;
+        StormEvaluateNubisDensityFromSamples(
+            lfShape,
+            hfModifier,
+            sourceProfile,
+            sourceCoverage,
+            1.0,
+            sourceMass,
+            HFStrength,
+            sourceCoarse,
+            sourceFine);
+
+        float sourceEdgeCarrier = saturate(
+            lfShape - hfModifier * lerp(0.09, 0.17, 1.0 - sourceProfile));
+        float envelopeOpen = StormTransportSmoother01(
+            (sourceEnvelope - 0.025) / 0.975);
+        float sourceReveal = sourceLifecycle * envelopeOpen;
+        float sourceClumpEdge = lerp(1.08, -0.16, sourceReveal);
+        float sourceClumpWidth = lerp(0.24, 0.14, sourceReveal);
+        float sourceClump = smoothstep(
+            sourceClumpEdge,
+            sourceClumpEdge + sourceClumpWidth,
+            sourceEdgeCarrier);
+        float sourceEndpointSurvival = 1.0 - StormTransportSmoother01(
+            (formationTimelineProgress - 0.84) / 0.15);
+        sourceCoarse *= sourceClump * sourceEndpointSurvival;
+        sourceFine *= sourceClump * sourceEndpointSurvival;
+
+        OutCoarseDensity = formationInitialFade * saturate(
+            destinationCoarse
+            + sourceCoarse * (1.0 - destinationCoarse));
+        return formationInitialFade * saturate(
+            destinationFine
+            + sourceFine * (1.0 - destinationFine));
+    }
+
+    float3 dissolvedLF;
+    float3 dissolvedHF;
+    float survival;
+    StormBuildDissolutionTransport(
+        domain,
+        h,
+        lifecycle.Progress,
+        LFUVW,
+        HFUVW,
+        dissolvedLF,
+        dissolvedHF,
+        survival);
+
+    float lfShape;
+    float hfModifier;
+    StormSampleNubisNoiseUVWPhased(
+        LFNoiseTex,
+        LFNoiseSampler,
+        HFNoiseTex,
+        HFNoiseSampler,
+        CurlNoiseTex,
+        CurlNoiseSampler,
+        dissolvedLF,
+        dissolvedHF,
+        FlowOffsetA,
+        FlowOffsetB,
+        PhaseAWeight,
+        CurlUVW,
+        CurlTiling,
+        CurlDisplacementUVW,
+        h,
+        lfShape,
+        hfModifier);
+
+    float dissolvedCoarse;
+    float dissolvedFine;
+    StormEvaluateNubisDensityFromSamples(
+        lfShape,
+        hfModifier,
+        verticalProfile,
+        Coverage,
+        HeightInside,
+        domain.MatureStencil,
+        HFStrength,
+        dissolvedCoarse,
+        dissolvedFine);
+
+    // Dissolution removes connected LF clumps and reaches empty before Hidden.
+    float survivalClumpEdge = lerp(1.05, -0.12, survival);
+    float survivalClump = smoothstep(
+        survivalClumpEdge,
+        survivalClumpEdge + 0.12,
+        lfShape);
+    OutCoarseDensity = dissolvedCoarse * survivalClump;
+    return dissolvedFine * survivalClump;
+}
+
+float StormEvaluateMaterialDensityMDR(
+    Texture2D BottomProfileTex,
+    SamplerState BottomProfileSampler,
+    Texture2D TopProfileTex,
+    SamplerState TopProfileSampler,
+    Texture3D LFNoiseTex,
+    SamplerState LFNoiseSampler,
+    Texture3D HFNoiseTex,
+    SamplerState HFNoiseSampler,
+    Texture2D CurlNoiseTex,
+    SamplerState CurlNoiseSampler,
+    float Coverage,
+    float HLocal,
+    float HeightInside,
+    float BottomType,
+    float TopType,
+    float StormStencil,
+    float AnvilStrength,
+    float AnvilDepth,
+    float3 LFUVW,
+    float3 HFUVW,
+    float2 CurlUVW,
+    float2 MDRBodyCoord,
+    float CurlTiling,
+    float CurlDisplacementUVW,
+    float LFMacroMax,
+    float BottomWispyStrength,
+    float BottomHFStrength,
+    float BottomCurlStrength,
+    float HFStrength,
+    float HFStrengthAnvil,
+    float4 MDRBoundaries0,
+    float4 MDRBoundaries1,
+    float4 MDRSpeeds0,
+    float4 MDRSpeeds1,
+    float4 MDRPhases0,
+    float4 MDRPhases1,
+    float4 MDRSkews0,
+    float4 MDRSkews1,
+    float4 MDRControl0,
+    float4 MDRControl1,
+    out float OutCoarseDensity)
+{
+    const FStormMDRParameters mdr = StormMDRDecodeParameters(
+        MDRBoundaries0,
+        MDRBoundaries1,
+        MDRSpeeds0,
+        MDRSpeeds1,
+        MDRPhases0,
+        MDRPhases1,
+        MDRSkews0,
+        MDRSkews1,
+        MDRControl0,
+        MDRControl1);
+
+    FStormLifecycleSample lifecycle = StormDecodeLifecycle(LFMacroMax);
+    if (lifecycle.Mode == 3u)
+    {
+        OutCoarseDensity = 0.0;
+        return 0.0;
+    }
+
+    float h = saturate(HLocal);
+    FStormDomainSample domain = StormDecodeTransportDomain(
+        StormStencil,
+        Coverage,
+        LFUVW);
+
+    // Both profile inputs are fixed Texture Objects owned by MF_Erosion. Keep
+    // their bindings intact and only sample them with the shared 1-HLocal V
+    // convention; BottomType adds no separate band or HF erosion branch.
+    float bottomProfile = StormEvaluateBottomTypeProfile(
+        BottomProfileTex,
+        BottomProfileSampler,
+        h,
+        BottomType);
+    float topProfile = StormEvaluateCloudTypeProfile(
+        TopProfileTex,
+        TopProfileSampler,
+        h,
+        TopType);
+    float verticalProfile = StormEvaluateVerticalProfile(
+        bottomProfile,
+        topProfile);
+
+    // The mature endpoint is the direct 2015 Nubis order, with no lifecycle
+    // transport or additional BottomType-driven morphology or erosion.
+    if (lifecycle.Mode == 1u)
+    {
+        float lfShape;
+        float hfModifier;
+        StormSampleNubisNoiseMDR(
+            LFNoiseTex,
+            LFNoiseSampler,
+            HFNoiseTex,
+            HFNoiseSampler,
+            CurlNoiseTex,
+            CurlNoiseSampler,
+            LFUVW,
+            HFUVW,
+            CurlUVW,
+            CurlTiling,
+            CurlDisplacementUVW,
+            h,
+            MDRBodyCoord,
+            domain,
+            lifecycle,
+            mdr,
+            lfShape,
+            hfModifier);
+
+        float fineDensity;
+        StormEvaluateNubisDensityFromSamples(
+            lfShape,
+            hfModifier,
+            verticalProfile,
+            Coverage,
+            HeightInside,
+            domain.MatureStencil,
+            HFStrength,
+            OutCoarseDensity,
+            fineDensity);
+        return fineDensity;
+    }
+
+    if (lifecycle.Mode == 0u)
+    {
+        float formationTimelineProgress = lerp(
+            0.28,
+            1.0,
+            lifecycle.Progress);
+        float formationInitialFade = StormTransportSmoother01(
+            lifecycle.Progress / 0.045);
+
+        float3 transportedLF;
+        float3 transportedHF;
+        float condensation;
+        float sourceMass;
+        float sourceEnvelope;
+        float sourceProfile;
+        float breakup;
+        float sourceLifecycle;
+        StormBuildFormationTransport(
+            domain,
+            h,
+            HeightInside,
+            formationTimelineProgress,
+            LFUVW,
+            HFUVW,
+            transportedLF,
+            transportedHF,
+            condensation,
+            sourceMass,
+            sourceEnvelope,
+            sourceProfile,
+            breakup,
+            sourceLifecycle);
+
+        float lfShape;
+        float hfModifier;
+        StormSampleNubisNoiseMDR(
+            LFNoiseTex,
+            LFNoiseSampler,
+            HFNoiseTex,
+            HFNoiseSampler,
+            CurlNoiseTex,
+            CurlNoiseSampler,
+            transportedLF,
+            transportedHF,
+            CurlUVW,
+            CurlTiling,
+            CurlDisplacementUVW,
+            h,
+            MDRBodyCoord,
+            domain,
+            lifecycle,
+            mdr,
+            lfShape,
+            hfModifier);
+
+        float destinationCoarse;
+        float destinationFine;
+        StormEvaluateNubisDensityFromSamples(
+            lfShape,
+            hfModifier,
+            verticalProfile,
+            Coverage,
+            HeightInside,
+            domain.MatureStencil,
+            HFStrength,
+            destinationCoarse,
+            destinationFine);
+
+        float destinationEdgeCarrier = saturate(
+            lfShape - hfModifier * lerp(0.07, 0.13, 1.0 - h));
+
+        float destinationEnable = StormTransportSmoother01(
+            (formationTimelineProgress - 0.46) / 0.34);
+        float endpointDelay = saturate(
+            (1.0 - destinationEdgeCarrier) * 0.58
+            + (1.0 - domain.MatureStencil) * 0.17
+            + (1.0 - condensation) * 0.25);
+        float endpointCarrierLock = StormTransportSmoother01(
+            (formationTimelineProgress
+                - lerp(0.84, 0.975, endpointDelay))
+            / lerp(0.13, 0.024, endpointDelay));
+        endpointCarrierLock = max(
+            endpointCarrierLock,
+            step(0.9995, formationTimelineProgress));
+        float destinationReveal = condensation * destinationEnable;
+        float destinationClumpEdge = lerp(1.06, -0.18, destinationReveal);
+        float destinationClumpWidth = lerp(0.22, 0.14, destinationReveal);
+        float destinationClump = smoothstep(
+            destinationClumpEdge,
+            destinationClumpEdge + destinationClumpWidth,
+            destinationEdgeCarrier);
+        destinationClump = lerp(
+            destinationClump,
+            1.0,
+            endpointCarrierLock);
+        destinationCoarse *= destinationClump;
+        destinationFine *= destinationClump;
+
+        float sourceCoverage = lerp(0.41, 0.74, breakup);
+        float sourceCoarse;
+        float sourceFine;
+        StormEvaluateNubisDensityFromSamples(
+            lfShape,
+            hfModifier,
+            sourceProfile,
+            sourceCoverage,
+            1.0,
+            sourceMass,
+            HFStrength,
+            sourceCoarse,
+            sourceFine);
+
+        float sourceEdgeCarrier = saturate(
+            lfShape - hfModifier * lerp(0.09, 0.17, 1.0 - sourceProfile));
+        float envelopeOpen = StormTransportSmoother01(
+            (sourceEnvelope - 0.025) / 0.975);
+        float sourceReveal = sourceLifecycle * envelopeOpen;
+        float sourceClumpEdge = lerp(1.08, -0.16, sourceReveal);
+        float sourceClumpWidth = lerp(0.24, 0.14, sourceReveal);
+        float sourceClump = smoothstep(
+            sourceClumpEdge,
+            sourceClumpEdge + sourceClumpWidth,
+            sourceEdgeCarrier);
+        float sourceEndpointSurvival = 1.0 - StormTransportSmoother01(
+            (formationTimelineProgress - 0.84) / 0.15);
+        sourceCoarse *= sourceClump * sourceEndpointSurvival;
+        sourceFine *= sourceClump * sourceEndpointSurvival;
+
+        OutCoarseDensity = formationInitialFade * saturate(
+            destinationCoarse
+            + sourceCoarse * (1.0 - destinationCoarse));
+        return formationInitialFade * saturate(
+            destinationFine
+            + sourceFine * (1.0 - destinationFine));
+    }
+
+    float3 dissolvedLF;
+    float3 dissolvedHF;
+    float survival;
+    StormBuildDissolutionTransport(
+        domain,
+        h,
+        lifecycle.Progress,
+        LFUVW,
+        HFUVW,
+        dissolvedLF,
+        dissolvedHF,
+        survival);
+
+    float lfShape;
+    float hfModifier;
+    StormSampleNubisNoiseMDR(
+        LFNoiseTex,
+        LFNoiseSampler,
+        HFNoiseTex,
+        HFNoiseSampler,
+        CurlNoiseTex,
+        CurlNoiseSampler,
+        dissolvedLF,
+        dissolvedHF,
+        CurlUVW,
+        CurlTiling,
+        CurlDisplacementUVW,
+        h,
+        MDRBodyCoord,
+        domain,
+        lifecycle,
+        mdr,
+        lfShape,
+        hfModifier);
+
+    float dissolvedCoarse;
+    float dissolvedFine;
+    StormEvaluateNubisDensityFromSamples(
+        lfShape,
+        hfModifier,
+        verticalProfile,
+        Coverage,
+        HeightInside,
+        domain.MatureStencil,
+        HFStrength,
+        dissolvedCoarse,
+        dissolvedFine);
+
+    // Dissolution removes connected LF clumps and reaches empty before Hidden.
+    float survivalClumpEdge = lerp(1.05, -0.12, survival);
+    float survivalClump = smoothstep(
+        survivalClumpEdge,
+        survivalClumpEdge + 0.12,
+        lfShape);
+    OutCoarseDensity = dissolvedCoarse * survivalClump;
+    return dissolvedFine * survivalClump;
+}

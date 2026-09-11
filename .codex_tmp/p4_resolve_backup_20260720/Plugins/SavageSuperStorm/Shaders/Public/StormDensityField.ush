@@ -1,0 +1,296 @@
+#pragma once
+
+#include "/SavageSuperStormShaders/Public/StormCoordinates.ush"
+
+// Canonical 2015 Nubis density contract:
+//
+//   LFWorley  = dot(LFNoise.gba, float3(0.625, 0.250, 0.125))
+//   LFShape   = remap(LFNoise.r, -(1 - LFWorley), 1, 0, 1)
+//   Bottom    = BottomProfile(BottomType)
+//   Top       = TopProfile(TopType)
+//   Profile   = Bottom * Top
+//   BaseCloud = LFShape * Profile
+//   Covered   = remap(BaseCloud, 1 - Coverage, 1, 0, 1) * Coverage
+//   Coarse    = Covered * HeightInside * StormStencil
+//   HFFBM     = dot(HFNoise.rgb, float3(0.625, 0.250, 0.125))
+//   HFMod     = lerp(HFFBM, 1 - HFFBM, saturate(HLocal * 10))
+//   Fine      = remap(Covered, HFMod * HFStrength, 1, 0, 1)
+//               * HeightInside * StormStencil
+//
+// Coarse density ends after profile and Coverage. Only fine density samples
+// and applies the common HF erosion. BottomType and TopType are independent
+// coordinates for their profile LUTs; no extra type-driven erosion is applied.
+// ShapeRT1 = (raw Coverage, BottomType, TopType, StormStencil)
+// Height coordinate contract:
+//   CloudLayerHeight01 = 0 at the Volumetric Cloud layer bottom, 1 at its top.
+//   ShapeRT2.r/b are absolute bounds in that same cloud-layer coordinate.
+//   HLocal is the only per-column coordinate: 0 at MinLayerHeight01,
+//   1 at MaxLayerHeight01. No altitude or adjustment parameter is decoded here.
+// ShapeRT2 = (MinLayerHeight01, unused, MaxLayerHeight01, CenterMask)
+
+struct FStormHeightSample
+{
+    float MinLayerHeight01;
+    float MaxLayerHeight01;
+    float HeightInside;
+    float HLocal;
+};
+
+struct FStormNoiseCoordinates
+{
+    float3 ReferenceStormLocalKm;
+    float3 LFReferencePositionKm;
+    float3 HFReferencePositionKm;
+    float2 CurlReferencePositionKm;
+};
+
+float StormRemap(
+    float Value,
+    float OriginalMin,
+    float OriginalMax,
+    float NewMin,
+    float NewMax)
+{
+    float denominator = OriginalMax - OriginalMin;
+    if (abs(denominator) < 1.0e-4)
+    {
+        return NewMin;
+    }
+
+    return NewMin
+        + ((Value - OriginalMin) / denominator)
+        * (NewMax - NewMin);
+}
+
+float StormRemapSaturated(
+    float Value,
+    float OriginalMin,
+    float OriginalMax,
+    float NewMin,
+    float NewMax)
+{
+    return saturate(StormRemap(
+        Value,
+        OriginalMin,
+        OriginalMax,
+        NewMin,
+        NewMax));
+}
+
+float StormDecodeNubisLFShape(float4 LFRaw)
+{
+    // The current LF asset's R channel is already the final baked
+    // Perlin-Worley carrier. Reapplying GBA here would double-shape it.
+    return saturate(LFRaw.r);
+}
+
+
+float StormDecodeNubisHFFBM(float3 HFRaw)
+{
+    // HF texture stores raw Worley octaves, not inverted Worley.
+    return saturate(dot(
+        HFRaw,
+        float3(0.625, 0.250, 0.125)));
+}
+
+float StormApplyCoverage(float BaseCloud, float Coverage)
+{
+    float coverage = saturate(Coverage);
+    float remappedCloud = StormRemapSaturated(
+        saturate(BaseCloud),
+        1 - coverage,
+        1.0,
+        0.0,
+        1.0);
+    return remappedCloud * coverage;
+}
+
+float StormEvaluateCoveredBaseCloud(
+    float LFShape,
+    float VerticalProfile,
+    float Coverage)
+{
+    float baseCloud = saturate(LFShape) * saturate(VerticalProfile);
+    return StormApplyCoverage(baseCloud, Coverage);
+}
+
+float StormEvaluateHeightDependentHFModifier(float HFFBM, float HLocal)
+{
+    float hf = saturate(HFFBM);
+    return lerp(
+        hf,
+        1.0 - hf,
+        saturate(HLocal * 10.0));
+}
+
+float StormEvaluateBottomTopVerticalProfile(
+    float BottomProfile,
+    float TopProfile)
+{
+    return saturate(saturate(BottomProfile) * saturate(TopProfile));
+}
+
+float StormApplyHFErosion(
+    float CoveredBaseCloud,
+    float HFModifier,
+    float HFStrength)
+{
+    return StormRemapSaturated(
+        saturate(CoveredBaseCloud),
+        saturate(HFModifier) * max(HFStrength, 0.0),
+        1.0,
+        0.0,
+        1.0);
+}
+
+float StormApplyDensityMasks(
+    float Density,
+    float HeightInside,
+    float StormStencil)
+{
+    // ShapeRT stores an inclusion stencil: one inside and zero outside.
+    return saturate(Density)
+        * saturate(HeightInside)
+        * saturate(StormStencil);
+}
+
+FStormHeightSample StormDecodeLayerHeightSample(
+    float CloudLayerHeight01,
+    float MinLayerHeight01,
+    float MaxLayerHeight01)
+{
+    FStormHeightSample result;
+    result.MinLayerHeight01 = saturate(MinLayerHeight01);
+    result.MaxLayerHeight01 = max(
+        saturate(MaxLayerHeight01),
+        result.MinLayerHeight01 + 1.0e-4);
+    result.HeightInside = step(result.MinLayerHeight01, CloudLayerHeight01)
+        * step(CloudLayerHeight01, result.MaxLayerHeight01);
+    result.HLocal = saturate(
+        (CloudLayerHeight01 - result.MinLayerHeight01)
+        / max(result.MaxLayerHeight01 - result.MinLayerHeight01, 1.0e-4));
+    return result;
+}
+
+FStormHeightSample StormDecodeLayerHeightSample(
+    float CloudLayerHeight01,
+    float4 ShapeRT2)
+{
+    return StormDecodeLayerHeightSample(
+        CloudLayerHeight01,
+        ShapeRT2.r,
+        ShapeRT2.b);
+}
+
+// Transitional alias for materials saved before the explicit cloud-layer ABI.
+FStormHeightSample StormDecodeHeightSample(
+    float CloudLayerHeight01,
+    float4 ShapeRT2)
+{
+    return StormDecodeLayerHeightSample(CloudLayerHeight01, ShapeRT2);
+}
+
+float StormCurrentRadiusKm(float CurrentStormRadiusCm)
+{
+    return max(abs(CurrentStormRadiusCm) * 1.0e-5, 1.0e-3);
+}
+
+float StormProportionalScale(float CurrentStormRadiusCm, float ReferenceStormRadiusKm)
+{
+    return StormCurrentRadiusKm(CurrentStormRadiusCm)
+        / max(abs(ReferenceStormRadiusKm), 1.0e-3);
+}
+
+float3 StormMakeCurrentLocalKm(
+    float2 StormLocalXYCm,
+    float SampleAltitudeKm,
+    float StormBaseAltitudeKm)
+{
+    return float3(
+        StormLocalXYCm * 1.0e-5,
+        SampleAltitudeKm - StormBaseAltitudeKm);
+}
+
+float3 StormMakeReferenceLocalKm(float3 CurrentStormLocalKm, float StormScale)
+{
+    return CurrentStormLocalKm / max(abs(StormScale), 1.0e-3);
+}
+
+FStormNoiseCoordinates StormMakeNoiseCoordinates(
+    float3 CurrentStormLocalKm,
+    float StormScale,
+    float3 ReferenceAdvectionVelocityLocalKmPerSec,
+    float TimeSeconds,
+    float LFAdvectionMultiplier,
+    float HFAdvectionMultiplier,
+    float CurlAdvectionMultiplier)
+{
+    FStormNoiseCoordinates result;
+    result.ReferenceStormLocalKm = StormMakeReferenceLocalKm(
+        CurrentStormLocalKm, StormScale);
+    result.LFReferencePositionKm = result.ReferenceStormLocalKm
+        - ReferenceAdvectionVelocityLocalKmPerSec
+        * TimeSeconds
+        * LFAdvectionMultiplier;
+    result.HFReferencePositionKm = result.ReferenceStormLocalKm
+        - ReferenceAdvectionVelocityLocalKmPerSec
+        * TimeSeconds
+        * HFAdvectionMultiplier;
+    result.CurlReferencePositionKm = result.ReferenceStormLocalKm.xy
+        - ReferenceAdvectionVelocityLocalKmPerSec.xy
+        * TimeSeconds
+        * CurlAdvectionMultiplier;
+    return result;
+}
+
+float2 StormClampProfileUV(Texture2D ProfileTex, float ProfileType, float ProfileV)
+{
+    uint profileWidth;
+    uint profileHeight;
+    ProfileTex.GetDimensions(profileWidth, profileHeight);
+    float2 profileSize = max(
+        float2(profileWidth, profileHeight),
+        float2(1.0, 1.0));
+    float2 halfTexel = 0.5 / profileSize;
+    return clamp(
+        float2(saturate(ProfileType), saturate(ProfileV)),
+        halfTexel,
+        1.0 - halfTexel);
+}
+
+float StormEvaluateCloudTypeProfile(
+    Texture2D TopProfileTex,
+    SamplerState TopProfileSampler,
+    float HLocal,
+    float CloudType)
+{
+    // The authored LUT is stored top-to-bottom, so local height is reversed.
+    float2 profileUV = StormClampProfileUV(
+        TopProfileTex,
+        CloudType,
+        1.0 - saturate(HLocal));
+    float verticalProfile = saturate(Texture2DSampleLevel(
+        TopProfileTex,
+        TopProfileSampler,
+        profileUV,
+        0).r);
+    return verticalProfile;
+}
+
+float StormEvaluateBottomTypeProfile(
+    Texture2D BottomProfileTex,
+    SamplerState BottomProfileSampler,
+    float HLocal,
+    float BottomType)
+{
+    // Bottom and Top LUTs share the top-to-bottom V convention.
+    float2 profileUV = StormClampProfileUV(
+        BottomProfileTex,
+        BottomType,
+        1.0 - saturate(HLocal));
+    return saturate(Texture2DSampleLevel(
+        BottomProfileTex,
+        BottomProfileSampler,
+        profileUV,
+        0).r);
+}
