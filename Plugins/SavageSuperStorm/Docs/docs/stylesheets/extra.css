@@ -1,6 +1,0 @@
-/**
- * Uses the secondary foreground color for figure captions in every theme.
- */
-.md-typeset figcaption {
-  color: var(--md-default-fg-color--light);
-}

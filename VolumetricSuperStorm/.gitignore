@@ -1,0 +1,62 @@
+# Unreal Engine generated files
+Binaries/
+Build/
+DerivedDataCache/
+Intermediate/
+Saved/
+
+# Visual Studio and IDE local state
+.vs/
+.vscode/
+.idea/
+*.suo
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+*.ipch
+
+# Generated solution/project files
+*.sln
+*.slnx
+*.xcodeproj/
+*.xcworkspace/
+
+# Build/debug outputs
+*.pdb
+*.ilk
+*.obj
+*.pch
+*.log
+*.tmp
+*.dmp
+
+# User- and OS-local files
+*.DotSettings.user
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local/private working material
+/.codex_tmp/
+/Artifacts/
+/PptBuild/
+/PptNarrativeBuild/
+/PptNarrativeBuildV2/
+/PptNarrativeBuildV3/
+/PptResultSlideBuild/
+/outputs/
+
+# The host project's Content is intentionally omitted from this public repository.
+# Plugin-packaged Content under Plugins/*/Content remains tracked.
+/Content/
+/Tools/Generated/
+
+# Maps and map-only data must not be committed anywhere.
+*.umap
+**/__ExternalActors__/
+**/__ExternalObjects__/
+*_HLOD*_Instancing.uasset
+
+# Generated documentation site output
+/Plugins/VolumetricSuperStorm/Docs/site/

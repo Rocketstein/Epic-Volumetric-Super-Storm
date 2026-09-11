@@ -1,0 +1,309 @@
+﻿// Copyright 2026 GoroGoro. All Rights Reserved.
+
+/**
+ * @file StormControlCS.usf
+ * @brief Builds the primary storm shape textures.
+ */
+
+#pragma once
+#include "/Engine/Public/Platform.ush"
+#include "/VolumetricSuperStormShaders/Public/StormCoordinates.ush"
+#include "/VolumetricSuperStormShaders/Public/StormFlowMapContract.ush"
+#include "/VolumetricSuperStormShaders/Public/StormShapeField.ush"
+
+uint   Resolution;
+float2 StormExtent;
+float  StormRadius;
+
+float                    EnvelopeRadius;
+float                    EnvelopeFalloff;
+float                    OuterBrimRadiusScale;
+uint                     CoverageStrengthCurveLUTSize;
+StructuredBuffer<float4> CoverageStrengthCurveLUT;
+uint                     TypeStrengthCurveLUTSize;
+StructuredBuffer<float4> TypeStrengthCurveLUT;
+uint                     LayerHeightCurveLUTSize;
+StructuredBuffer<float4> LayerHeightCurveLUT;
+
+Texture2D<float4> UpperFlowMapTexture;
+SamplerState      UpperFlowMapSampler;
+float2            FallbackWindDirectionXY;
+uint              FlowMapEnabled;
+
+RWTexture2D<float4> OutShapeTexture;
+RWTexture2D<float4> OutShapeTexture2;
+
+static const float STORM_BOUNDARY_NOISE_SEED             = 41.0;
+static const float STORM_ANVIL_UPWIND_EXTENSION_RATIO    = 0.30;
+static const float STORM_ANVIL_CROSSWIND_EXTENSION_RATIO = 0.65;
+
+static const float STORM_ANVIL_BOUNDARY_EROSION01     = 0.090;
+static const float STORM_ANVIL_BOUNDARY_NOISE_SCALE   = 0.72;
+static const float STORM_BOUNDARY_EROSION_POWER       = 1.40;
+static const float STORM_ANVIL_FLOW_PROBE_RADIUS_BODY = 0.35;
+
+struct FStormCoverageStrengths
+{
+	float Body;
+	float Anvil;
+};
+
+float4 StormSampleCoverageCurve(float Radius01)
+{
+	float samplePosition = saturate(Radius01) * (float)(CoverageStrengthCurveLUTSize - 1u);
+	uint  index0         = min((uint)floor(samplePosition), CoverageStrengthCurveLUTSize - 1u);
+	uint  index1         = min(index0 + 1u, CoverageStrengthCurveLUTSize - 1u);
+	return lerp(CoverageStrengthCurveLUT[index0], CoverageStrengthCurveLUT[index1], frac(samplePosition));
+}
+
+FStormCoverageStrengths StormEvaluateCoverageStrengths(float BodyRadius01, float AnvilRadius01)
+{
+	float4 bodyCurveSample  = StormSampleCoverageCurve(BodyRadius01);
+	float4 anvilCurveSample = StormSampleCoverageCurve(AnvilRadius01);
+
+	FStormCoverageStrengths result;
+	result.Body  = saturate(bodyCurveSample.r);
+	result.Anvil = saturate(anvilCurveSample.a);
+	return result;
+}
+
+float StormComposeBodyCoverage(float AuthoredCoverage, float BodySupport)
+{
+	return saturate(AuthoredCoverage) * saturate(BodySupport);
+}
+
+float2 StormEvaluateTypeStrengths(float Radius01)
+{
+	float  samplePosition = saturate(Radius01) * (float)(TypeStrengthCurveLUTSize - 1u);
+	uint   index0         = min((uint)floor(samplePosition), TypeStrengthCurveLUTSize - 1u);
+	uint   index1         = min(index0 + 1u, TypeStrengthCurveLUTSize - 1u);
+	float4 typeStrengths  = lerp(TypeStrengthCurveLUT[index0], TypeStrengthCurveLUT[index1], frac(samplePosition));
+	return saturate(typeStrengths.gb);
+}
+
+float2 StormEvaluateLayerHeights01(float Radius01)
+{
+	float  samplePosition = saturate(Radius01) * (float)(LayerHeightCurveLUTSize - 1u);
+	uint   index0         = min((uint)floor(samplePosition), LayerHeightCurveLUTSize - 1u);
+	uint   index1         = min(index0 + 1u, LayerHeightCurveLUTSize - 1u);
+	float4 layerHeights   = lerp(LayerHeightCurveLUT[index0], LayerHeightCurveLUT[index1], frac(samplePosition));
+	return saturate(layerHeights.rb);
+}
+
+float2 StormShapeSafeDirection2D(float2 Value, float2 Fallback)
+{
+	float fallbackLengthSquared = dot(Fallback, Fallback);
+
+	float2 safeFallback = fallbackLengthSquared > 1.0e-8 ? Fallback * rsqrt(fallbackLengthSquared) : float2(1.0, 0.0);
+
+	float valueLengthSquared = dot(Value, Value);
+
+	return valueLengthSquared > 1.0e-8 ? Value * rsqrt(valueLengthSquared) : safeFallback;
+}
+
+float StormEvaluateLowFrequencyBoundaryNoise(float2 Coordinate, float Salt)
+{
+	float seededOffset = Hash21(float2(STORM_BOUNDARY_NOISE_SEED + Salt, STORM_BOUNDARY_NOISE_SEED * 1.731 + Salt * 0.619)) * 37.0;
+
+	float2 q = mul(float2x2(0.826, -0.564, 0.564, 0.826), Coordinate);
+
+	q += float2(seededOffset, seededOffset * 1.317);
+
+	float octave0 = ValueNoise2D(q);
+
+	q = mul(float2x2(0.731, 0.682, -0.682, 0.731), q) * 1.91 + float2(7.13, -4.67);
+
+	float octave1 = ValueNoise2D(q);
+
+	return saturate(octave0 * 0.72 + octave1 * 0.28);
+}
+
+float StormApplyInwardBoundaryErosion(float BaseDistance01, float2 NoiseCoordinate, float ErosionAmount01, float Salt)
+{
+	float boundaryNoise = StormEvaluateLowFrequencyBoundaryNoise(NoiseCoordinate, Salt);
+
+	float inwardDent = pow(saturate(1.0 - boundaryNoise), STORM_BOUNDARY_EROSION_POWER);
+
+	float boundaryRadiusScale = 1.0 - saturate(ErosionAmount01) * inwardDent;
+
+	return BaseDistance01 / max(boundaryRadiusScale, 0.5);
+}
+
+float StormEvaluateFootprintSupport(float OrganicDistance01, float Feather01)
+{
+	float safeFeather = max(Feather01, 0.0);
+
+	return safeFeather > 1.0e-5 ? 1.0 - smoothstep(1.0 - safeFeather, 1.0, OrganicDistance01) : 1.0 - step(1.0, OrganicDistance01);
+}
+
+struct FStormAnvilWindFrame
+{
+	float2 Direction;
+	float2 CrossDirection;
+	float  FlowInfluence;
+};
+
+float2 StormSampleUpperFlowMapXY(float2 UV)
+{
+	float4 encodedFlow = UpperFlowMapTexture.SampleLevel(UpperFlowMapSampler, saturate(UV), 0);
+
+	return StormDecodeFlowMapVelocity(encodedFlow).xy;
+}
+
+FStormAnvilWindFrame StormEvaluateAnvilWindFrame()
+{
+	float2 fallbackDirection = StormShapeSafeDirection2D(FallbackWindDirectionXY, float2(1.0, 0.0));
+
+	float2 bodyRadiusInFieldUV = 0.5 * max(abs(StormRadius), 1.0) / StormSafeHalfExtent(StormExtent);
+
+	float2 probeOffset = min(bodyRadiusInFieldUV * STORM_ANVIL_FLOW_PROBE_RADIUS_BODY, float2(0.24, 0.24));
+
+	float2 centerUV = float2(0.5, 0.5);
+
+	float2 centerFlow = StormSampleUpperFlowMapXY(centerUV);
+
+	float2 flowSum = centerFlow * 2.0 + StormSampleUpperFlowMapXY(centerUV + float2(probeOffset.x, 0.0)) + StormSampleUpperFlowMapXY(centerUV - float2(probeOffset.x, 0.0)) + StormSampleUpperFlowMapXY(centerUV + float2(0.0, probeOffset.y)) + StormSampleUpperFlowMapXY(centerUV - float2(0.0, probeOffset.y));
+
+	float2 averageFlow = flowSum / 6.0;
+
+	float averageFlowLength = length(averageFlow);
+
+	float flowInfluence = (FlowMapEnabled != 0u) ? saturate(averageFlowLength) : 0.0;
+
+	float2 flowDirection = StormShapeSafeDirection2D(averageFlow, fallbackDirection);
+
+	float2 steeringDirection = StormShapeSafeDirection2D(lerp(fallbackDirection, flowDirection, flowInfluence), fallbackDirection);
+
+	FStormAnvilWindFrame result;
+	result.Direction      = steeringDirection;
+	result.CrossDirection = float2(-steeringDirection.y, steeringDirection.x);
+	result.FlowInfluence  = flowInfluence;
+	return result;
+}
+
+void StormEvaluateWindAlignedAnvilFootprint(float2 BodyCoord, FStormAnvilWindFrame WindFrame, float AnvilOuterRadius, out float OutBaseDistance01, out float OutOrganicDistance01)
+{
+	float extension = max(AnvilOuterRadius - 1.0, 0.0);
+
+	float downwindExtent = 1.0 + extension;
+
+	float upwindExtent = 1.0 + extension * STORM_ANVIL_UPWIND_EXTENSION_RATIO;
+
+	float crosswindExtent = 1.0 + extension * STORM_ANVIL_CROSSWIND_EXTENSION_RATIO;
+
+	float alongWind = dot(BodyCoord, WindFrame.Direction);
+
+	float acrossWind = dot(BodyCoord, WindFrame.CrossDirection);
+
+	float downwindCenterShift = 0.5 * (downwindExtent - upwindExtent);
+
+	float alongWindHalfExtent = 0.5 * (downwindExtent + upwindExtent);
+
+	float2 ellipseCoordinate = float2((alongWind - downwindCenterShift) / max(alongWindHalfExtent, 1.0e-4), acrossWind / max(crosswindExtent, 1.0e-4));
+
+	OutBaseDistance01 = length(ellipseCoordinate);
+
+	OutOrganicDistance01 = StormApplyInwardBoundaryErosion(OutBaseDistance01, ellipseCoordinate * STORM_ANVIL_BOUNDARY_NOISE_SCALE, STORM_ANVIL_BOUNDARY_EROSION01, 271.37);
+}
+
+struct FStormShapeSample
+{
+	float Coverage;
+	float BottomType;
+	float TopType;
+	float StormStencil;
+	float MinLayerHeight01;
+	float MaxLayerHeight01;
+	float AnvilCoverageField;
+};
+
+FStormShapeSample StormEvaluateMatureShape(float2 BodyCoord)
+{
+	FStormShapeSample result;
+
+	float2 canonicalShapeUV = StormBodyCoordToCanonicalShapeUV(BodyCoord);
+
+	float r = length(BodyCoord);
+
+	float bodyRadius01 = saturate(r);
+
+	float anvilOuterRadius = max(abs(OuterBrimRadiusScale), 1.0e-4);
+
+	FStormAnvilWindFrame windFrame = StormEvaluateAnvilWindFrame();
+
+	float relativeEnvelopeFeather = saturate(EnvelopeFalloff / max(EnvelopeRadius, 1.0e-4));
+
+	float bodyCoverageSupport = StormEvaluateFootprintSupport(r, relativeEnvelopeFeather);
+
+	float bodyStencilInterior = 1.0 - step(1.0, r);
+
+	float anvilBaseDistance01;
+	float anvilOrganicDistance01;
+
+	StormEvaluateWindAlignedAnvilFootprint(BodyCoord, windFrame, anvilOuterRadius, anvilBaseDistance01, anvilOrganicDistance01);
+
+	float anvilRadius01 = saturate(anvilBaseDistance01);
+
+	float anvilRingWidth = max(anvilOuterRadius - 1.0, 0.0);
+
+	float anvilFeatherBodyRadii = min(relativeEnvelopeFeather * anvilOuterRadius, anvilRingWidth);
+
+	float anvilFeather01 = anvilFeatherBodyRadii / max(anvilOuterRadius, 1.0e-4);
+
+	float anvilSupport = StormEvaluateFootprintSupport(anvilOrganicDistance01, anvilFeather01);
+
+	float overallShapeSupport = max(bodyStencilInterior, anvilSupport);
+
+	float bodyOutsideDistance = max(r - 1.0, 0.0);
+
+	float anvilOutsideDistance = max(anvilOrganicDistance01 - 1.0, 0.0) * anvilOuterRadius;
+
+	float unionOutsideDistance = min(bodyOutsideDistance, anvilOutsideDistance);
+
+	float feederSupport = 1.0 - smoothstep(0.0, 0.68, unionOutsideDistance);
+
+	result.StormStencil = overallShapeSupport > 1.0e-5 ? 1.0 + overallShapeSupport : saturate(feederSupport);
+
+	FStormCoverageStrengths coverageStrengths = StormEvaluateCoverageStrengths(bodyRadius01, anvilRadius01);
+
+	result.Coverage = StormComposeBodyCoverage(coverageStrengths.Body, bodyCoverageSupport);
+
+	result.AnvilCoverageField = coverageStrengths.Anvil;
+
+	float2 radialTypeStrengths = StormEvaluateTypeStrengths(bodyRadius01);
+	result.BottomType          = radialTypeStrengths.x;
+	result.TopType             = radialTypeStrengths.y;
+
+	float2 layerHeights01   = StormEvaluateLayerHeights01(bodyRadius01);
+	result.MinLayerHeight01 = layerHeights01.x;
+	result.MaxLayerHeight01 = layerHeights01.y;
+	if (overallShapeSupport <= 1.0e-5)
+	{
+		float feederMacro         = SampleStormNoise(canonicalShapeUV + float2(0.173, -0.291), 3.7, 160.2);
+		result.Coverage           = 0.0;
+		result.BottomType         = 0.0;
+		result.TopType            = 0.0;
+		result.MinLayerHeight01   = lerp(0.055, 0.105, feederMacro);
+		result.MaxLayerHeight01   = lerp(0.28, 0.44, feederMacro);
+		result.AnvilCoverageField = 0.0;
+	}
+
+	return result;
+}
+
+[numthreads(NUM_THREADS_X, NUM_THREADS_Y, 1)]void BuildStormShapeRT(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	if (DispatchThreadID.x >= Resolution || DispatchThreadID.y >= Resolution)
+	{
+		return;
+	}
+
+	uint2             id            = DispatchThreadID.xy;
+	float2            uv            = (float2(id) + 0.5) / float(Resolution);
+	float2            stormPosWorld = StormFieldUVToLocalCm(uv, StormExtent);
+	float2            bodyCoord     = StormLocalCmToBodyCoord(stormPosWorld, StormRadius);
+	FStormShapeSample shape         = StormEvaluateMatureShape(bodyCoord);
+
+	OutShapeTexture[id]  = float4(shape.Coverage, shape.BottomType, shape.TopType, shape.StormStencil);
+	OutShapeTexture2[id] = float4(shape.MinLayerHeight01, 0.0, shape.MaxLayerHeight01, shape.AnvilCoverageField);
+}

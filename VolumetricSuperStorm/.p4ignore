@@ -1,0 +1,56 @@
+# Unreal Engine .p4ignore
+# Public source snapshot: plugin Source/Content/Shaders/Resources are tracked.
+
+# Build output, intermediates, and caches
+Binaries
+Build
+DerivedDataCache
+Intermediate
+Saved
+
+# IDE and editor caches
+.vs
+.vscode
+.idea
+
+# Generated solution/project files
+*.sln
+*.slnx
+*.suo
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+*.xcodeproj
+*.xcworkspace
+
+# User and OS files
+*.DotSettings.user
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local repository/workspace metadata
+.git
+.gitignore
+.gitattributes
+.claude
+.codex_tmp
+.venv
+__pycache__
+*.pyc
+*.pyo
+
+# The host project's assets and generated tool payloads are not public.
+# Do not ignore Plugins/*/Content: the plugin's required packaged assets are public.
+/Content
+/Tools/Generated
+
+# Maps and map-only data
+*.umap
+__ExternalActors__
+__ExternalObjects__
+*_HLOD*_Instancing.uasset
+
+# Generated documentation site output
+/Plugins/VolumetricSuperStorm/Docs/site
