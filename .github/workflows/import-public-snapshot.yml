@@ -5,7 +5,7 @@ on:
     branches:
       - automation/public-sanitized-import-20260911
     paths:
-      - .public_export/READY
+      - .public_import/request.json
 
 permissions:
   contents: write
@@ -19,7 +19,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Verify and install sanitized snapshot
+      - name: Download, verify, and install sanitized snapshot
         run: python3 .github/scripts/import_public_snapshot.py
 
       - name: Commit imported public snapshot
