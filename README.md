@@ -66,8 +66,6 @@ Your level should also contain the standard Unreal Engine sky components used by
 VolumetricSuperStorm/
 ├── Config/                                Unreal Engine project configuration
 ├── Docs/
-│   └── Release/
-│       └── FabListing.md                  Fab listing draft
 ├── Plugins/
 │   └── VolumetricSuperStorm/              Plugin code, shaders, resources, and packaged content
 ├── Source/                                Host Unreal Engine project module
